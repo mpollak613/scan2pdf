@@ -13,6 +13,8 @@
 #include <iostream>
 #include <leptonica/allheaders.h> // non-standard
 #include <limits>
+#include <math.h>
+#include <numbers>
 #include <ranges>
 #include <sane/sane.h>     // non-standard
 #include <sane/saneopts.h> // non-standard
@@ -234,10 +236,8 @@ Magick::Image get_next_image(SANE_Handle sane_scanner_handle)
     SANE_Byte *data = (SANE_Byte *) _TIFFmalloc(buf_size);
     SANE_Int sane_return;
     int y;
-    for (y = 0; (sane_read(sane_scanner_handle, data, buf_size, &sane_return) != SANE_STATUS_EOF) || sane_return != 0 /*y < sane_params.lines*/; ++y)
+    for (y = 0; (sane_read(sane_scanner_handle, data, buf_size, &sane_return) != SANE_STATUS_EOF) && sane_return != 0 /*y < sane_params.lines*/; ++y)
     {
-        // sane_read(sane_scanner_handle, data, buf_size, &sane_return);
-
         if (TIFFWriteScanline(tifffile, data, y, 0) != 1)
         {
             std::cout << "bad write!\n";
@@ -324,6 +324,17 @@ void exit_all()
     }
 }
 
+static void dump_image(Magick::Image &img, std::string name, bool should_stop = false)
+{
+#ifdef DEBUG
+    img.write(get_log_path() / std::string("debugged_image_" + name + ".jpg"));
+    if (should_stop)
+    {
+        throw std::runtime_error("output debug image and exiting!");
+    }
+#endif
+}
+
 int main(int argc, char **argv)
 {
     std::string filename;
@@ -383,7 +394,6 @@ int main(int argc, char **argv)
         }
     }
 
-
     try
     {
         logger.open(get_log_path() / "scan2pdf.log");
@@ -400,13 +410,15 @@ int main(int argc, char **argv)
 
         set_scanner_options(sane_scanner_handle);
 
-        logger.info << "Starting processing with filename: \'" << filename << "\'" << '\n';
         // we start processing images
+        logger.info << "Starting processing with filename: \'" << filename << "\'" << '\n';
         std::vector<Magick::Image> images;
         std::string document_text = "";
         for (size_t i = 0; sane_start(sane_scanner_handle) != SANE_STATUS_NO_DOCS; ++i)
         {
             Magick::Image image{get_next_image(sane_scanner_handle)};
+
+            dump_image(image, std::to_string(i) + std::to_string(1) + "initial");
 
             logger.info << "Image " << i << ": Digesting image" << '\n';
             std::cout << "Digesting Page(" << i + 1 << "):\n";
@@ -416,12 +428,10 @@ int main(int argc, char **argv)
             image.density(Magick::Point(std::get<SANE_Word>(sane_options.at(SANE_NAME_SCAN_RESOLUTION))));
 
             progress_meter(0, "  Processing image: ");
-            // Adjust gamma to correct values.
-            image.gamma(2.2);
-            progress_meter(5, "  Processing image: ");
 
             // Find the color of the scan background.
             Magick::Color border_color {image.pixelColor(0, 0)};
+            logger.debug << "Setting border color as R: " << border_color.quantumRed() << " G: " << border_color.quantumGreen() << " B: " << border_color.quantumBlue() << '\n';
             progress_meter(10, "  Processing image: ");
 
             // Trim the extra blank scan area on the top.
@@ -431,50 +441,60 @@ int main(int argc, char **argv)
             image.trim();
             image.repage();
             image.chop(Magick::Geometry(0, 1));
-            image.colorFuzz();
+            image.repage();
+            image.colorFuzz(0.0);
             progress_meter(20, "  Processing image: ");
+
+            dump_image(image, std::to_string(i) + std::to_string(2) + "top-trim");
 
             // Attempt to deskew image.
             logger.info << "Image " << i << ": Deskewing image" << '\n';
             Magick::Image canny_image {image};
-            canny_image.cannyEdge(0, 1, 0.01, .1);
+            canny_image.colorSpace(Magick::LinearGRAYColorspace);
+            canny_image.artifact("morphology:compose", "lighten");
+            canny_image.morphology(Magick::ConvolveMorphology, Magick::RobertsKernel, "@");
             canny_image.negate();
+            canny_image.threshold(QuantumRange * 0.8);
             canny_image.deskew(QuantumRange * 0.8);
-            canny_image.repage();
             image.backgroundColor(border_color);
-            image.rotate(std::stod(canny_image.formatExpression("%[deskew:angle]"), nullptr));
-            progress_meter(50, "  Processing image: ");
-
-            // trim to remove any edges added by deskew
-            logger.info << "Image " << i << ": Trimming edges after deskewing" << '\n';
-            image.backgroundColor(border_color);
-            image.defineValue("trim:percent-background", "0%");
+            double deskew_angle = std::stod(canny_image.formatExpression("%[deskew:angle]"), nullptr);
+            image.rotate(deskew_angle);
+            image.artifact("trim:background-color", border_color);
+            image.artifact("trim:percent-background", "0%");
             image.trim();
+            image.repage();
+            progress_meter(50, "  Processing image: ");
+            logger.debug << "Image " << i << ": Deskewing by " << deskew_angle << " degrees" << '\n';
+
+            dump_image(image, std::to_string(i) + std::to_string(3) + "deskewed");
+            dump_image(canny_image, std::to_string(i) + std::to_string(3) + "canny-deskew");
+
+            canny_image = image;
+            canny_image.colorSpace(Magick::LinearGRAYColorspace);
+            canny_image.artifact("morphology:compose", "lighten");
+            canny_image.morphology(Magick::ConvolveMorphology, Magick::RobertsKernel, "@");
+            canny_image.negate();
+            canny_image.threshold(QuantumRange * 0.8);
+            canny_image.shave("1x1"); // remove black border
+            dump_image(canny_image, std::to_string(i) + std::to_string(4) + "canny-before-trim");
+            canny_image.artifact("trim:background-color", "white");
+            canny_image.artifact("trim:percent-background", "99.9%");
+            canny_image.trim();
+            image.crop(canny_image.formatExpression("%wx%h%X+%Y"));
             image.repage();
             progress_meter(70, "  Processing image: ");
 
             // Remove 1% from the top (and more as-neeed) to remove any shadow left by the first trim.
             logger.info << "Image " << i << ": Trimming shadow" << '\n';
             image.rotate(180);
-            image.chop(Magick::Geometry(0, std::stoul(image.formatExpression("%h")) * 0.01));
-            image.repage();
+            image.chop(Magick::Geometry(0, 10));
+            // image.chop(Magick::Geometry(0, std::stoul(image.formatExpression("%h")) * 0.01));
             image.rotate(180);
-            progress_meter(80, "  Processing image: ");
-
-            // Trim off the left and right edges using edge detection.
-            logger.info << "Image " << i << ": Removing left and right scan areas" << '\n';
-            canny_image = image;
-            canny_image.cannyEdge(0, 1, 0.01, 0.1);
-            canny_image.negate();
-            canny_image.trim();
-            image.crop(Magick::Geometry(canny_image.formatExpression("%wx%H%X+0")));
             image.repage();
-            progress_meter(90, "  Processing image: ");
 
-            // Remove 1% from left and right sides to remove any edges left over by the trim.
-            logger.info << "Image " << i << ": Trimming left and right edges" << '\n';
-            image.shave(Magick::Geometry(std::stoul(image.formatExpression("%w")) * 0.01, 0));
-            image.repage();
+            dump_image(canny_image, std::to_string(i) + std::to_string(4) + "canny");
+            dump_image(image, std::to_string(i) + std::to_string(4) + "normal");
+
             progress_meter(100, "  Processing image: ");
 
             std::cout << "  Attempting to reduce file size:\n";
@@ -485,25 +505,36 @@ int main(int argc, char **argv)
             double gray_factor = std::stod(gray_factor_image.separate(MagickCore::GreenChannel).formatExpression("%[fx:kurtosis]"));
             logger.debug << "Image " << i << ": Gray Factor: " << gray_factor << '\n';
 
+            // Adjust gamma to correct values.
+            image.gamma(2.2);
+            image.enhance();
+
+            dump_image(image, std::to_string(i) + std::to_string(7) + "enhanced");
+
             if (gray_factor < 0.01)
             {
                 // Adjust contrast and fill background.
                 image.brightnessContrast(0, 30);
                 image.opaque(Magick::Color("white"), Magick::Color("white"));
-                image.enhance();
+                logger.debug << "Image " << i << ": increasing contrast" << '\n';
             }
 
             if (gray_factor < 0)
             {
                 // Additionally, convert to monocrome.
+                // TODO: brighten image and replace whites before thresholding
+                // image.brightnessContrast(0, 20);
                 image.autoThreshold(Magick::KapurThresholdMethod);
-                // image.autoThreshold(Magick::TriangleThresholdMethod);
+                logger.debug << "Image " << i << ": applying threshold" << '\n';
             }
             else if (gray_factor < 0.00055)
             {
                 // Additionally, convert to grayscale.
                 image.colorSpace(Magick::LinearGRAYColorspace);
+                logger.debug << "Image " << i << ": converting to greyscale color space" << '\n';
             }
+
+            dump_image(image, std::to_string(i) + std::to_string(8) + "reduced");
 
             // Find mostly white images using mean 'whiteness'
             Magick::Image perc_white_image {image};
@@ -513,7 +544,7 @@ int main(int argc, char **argv)
             // Ask user if almost white images should be deleted.
             bool keep_image {true};
             logger.debug << "Image " << i << ": Percent white: " << perc_white << '\n';
-            if (perc_white > 0.985)
+            if (perc_white > 0.98)
             {
                 logger.info << "Image " << i << ": May be blank" << '\n';
 
@@ -542,7 +573,7 @@ int main(int argc, char **argv)
             if (keep_image)
             {
                 Magick::Blob bimage;
-                image.write(&bimage);
+                image.write(&bimage, "tiff");
 
                 // Attempt to orient using tesseract.
                 std::cout << "  Attempting to re-orient image: ";
@@ -557,10 +588,11 @@ int main(int argc, char **argv)
                 api->DetectOrientationScript(&ori_deg, &ori_conf, &script_name, &script_conf);
 
                 logger.debug << "Image " << i << ": Rotating by " << ori_deg << " degrees" << '\n';
-                image.rotate(-ori_deg);
+                image.rotate(360 - ori_deg);
                 std::cout << "Rotated image " << ori_deg << " degrees.\n";
 
                 logger.info << "Image " << i << ": Collecting text" << '\n';
+                pimage = pixRotateOrth(pimage, ori_deg / 90);
                 api->SetImage(pimage);
                 document_text += api->GetUTF8Text();
 
@@ -573,6 +605,11 @@ int main(int argc, char **argv)
 
         sane_cancel(sane_scanner_handle);
         sane_close(sane_scanner_handle);
+
+        if (images.size() == 0)
+        {
+            throw std::runtime_error("Too few images to output a pdf.");
+        }
 
         logger.info << "Starting to process pdf" << '\n';
         std::cout << "Converting to a searchable PDF: ";
@@ -590,7 +627,7 @@ int main(int argc, char **argv)
         tesseract::TessPDFRenderer *renderer {new tesseract::TessPDFRenderer(std::string(tmp_path + filename).c_str(), api->GetDatapath(), false)};
         if (!api->ProcessPages(std::string(tmp_path + filename + ".tiff").c_str(), nullptr, 5000, renderer))
         {
-            throw std::runtime_error("FATAL: Could not write out file.");
+            throw std::runtime_error("Could not write output file.");
         }
 
         std::string newFileName = filedate + "_" + filename + "_" + filestore + "_" + filetransaction + ".pdf";
@@ -600,7 +637,7 @@ int main(int argc, char **argv)
         if (ecode.value() != 0)
         {
             logger.warning << "Failed to move output file by renaming: \'" << ecode.message() << "\' -> Trying copy instead" << '\n';
-            if (!std::filesystem::copy_file(tmp_path + filename + ".pdf", outpath + newFileName))
+            if (!std::filesystem::copy_file(tmp_path + filename + ".pdf", outpath + newFileName, std::filesystem::copy_options::update_existing, ecode))
             {
                 throw std::runtime_error("Failed to move or copy output file: \'" + ecode.message() + "\'");
             }
