@@ -169,7 +169,7 @@ int main(int argc, char** argv)
 
             // Find the color of the scan background.
             Magick::Color border_color{image.pixelColor(0, 0)};
-            logger.debug << "Setting border color as R: " << border_color.quantumRed() << " G: " << border_color.quantumGreen() << " B: " << border_color.quantumBlue() << '\n';
+            logger.debug << "Image " << i << ": Setting border color as R: " << (border_color.quantumRed() / QuantumRange * 255) << " G: " << (border_color.quantumGreen() / QuantumRange * 255) << " B: " << (border_color.quantumBlue() / QuantumRange * 255) << '\n';
             progress_meter(10, "  Processing image: ");
 
             // Trim the extra blank scan area on the top.
@@ -212,11 +212,11 @@ int main(int argc, char** argv)
             canny_image.artifact("morphology:compose", "lighten");
             canny_image.morphology(Magick::ConvolveMorphology, Magick::RobertsKernel, "@");
             canny_image.negate();
-            canny_image.threshold(QuantumRange * 0.8);
+            canny_image.threshold(QuantumRange * 0.87);
             canny_image.shave("1x1"); // remove black border
             dump_image(canny_image, std::to_string(i) + std::to_string(4) + "canny-before-trim");
             canny_image.artifact("trim:background-color", "white");
-            canny_image.artifact("trim:percent-background", "99.9%");
+            canny_image.artifact("trim:percent-background", "99.7%");
             canny_image.trim();
             image.crop(canny_image.formatExpression("%wx%h%X+%Y"));
             image.repage();
@@ -239,8 +239,20 @@ int main(int argc, char** argv)
             // Check if the images contain little to no color (fmw42: https://legacy.imagemagick.org/discourse-server/viewtopic.php?t=19580).
             logger.info << "Image " << i << ": Checking if blank" << '\n';
             Magick::Image gray_factor_image{image};
-            gray_factor_image.colorSpace(Magick::HCLColorspace);
-            double gray_factor = std::stod(gray_factor_image.separate(MagickCore::GreenChannel).formatExpression("%[fx:kurtosis]"));
+            gray_factor_image.colorSpace(Magick::HSLColorspace);
+            double gray_factor = std::stod(gray_factor_image.formatExpression("%[fx:mean.g]"));
+
+            Magick::Image pure_bw_image{image};
+            pure_bw_image.gamma(2.2);
+            pure_bw_image.solarize(QuantumRange * 0.5);
+            pure_bw_image.colorSpace(Magick::GRAYColorspace);
+            auto image_stats{pure_bw_image.statistics().channel(Magick::PixelChannel::GrayPixelChannel)};
+            logger.debug << "Image " << i << ": Gray mean: " << (image_stats.mean() / QuantumRange * 255) << '\n';
+            logger.debug << "Image " << i << ": Gray std-dev: " << (image_stats.standardDeviation() / QuantumRange * 255) << '\n';
+            if ((image_stats.mean() / QuantumRange * 255) < (255.0 / 4.0) && ((image_stats.standardDeviation() - image_stats.mean()) / QuantumRange * 255) < 15)
+            {
+                gray_factor = 0.0000005;
+            }
             logger.debug << "Image " << i << ": Gray Factor: " << gray_factor << '\n';
 
             // Adjust gamma to correct values.
@@ -249,7 +261,7 @@ int main(int argc, char** argv)
 
             dump_image(image, std::to_string(i) + std::to_string(7) + "enhanced");
 
-            if (gray_factor < 0.01) {
+            if (gray_factor < 0.1) {
                 // Adjust contrast and fill background.
                 image.brightnessContrast(0, 30);
                 image.opaque(Magick::Color("white"), Magick::Color("white"));
