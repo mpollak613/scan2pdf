@@ -1,5 +1,4 @@
 .vscode
 old_bash
-xsane
 *.old
 find_date.h
