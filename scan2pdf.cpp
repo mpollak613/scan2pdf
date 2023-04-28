@@ -13,7 +13,6 @@
 #include <hytrax/hyx_logger.h>
 #include <hytrax/hyx_parser.h>
 #include <hytrax/hyx_sane.h>
-#include <hytrax/hyx_tesseract.h>
 #include <iostream>
 #include <leptonica/allheaders.h> // non-standard
 #include <limits>
@@ -38,13 +37,15 @@
 #include <tiffio.hxx> // non-standard
 #endif                // !HAVE_LIBTIFF
 
-constexpr static std::string_view version{"2.0.c.0"};
+constexpr static std::string_view version{"2.0.c.1"};
 
 constexpr long double rgb_value(long double quantum_val);
 
 long double operator""_quantum_percent(long double percent);
 
-hyx::logger& logger{hyx::logger::get_instance()};
+hyx::logger* logger;
+auto api{std::make_unique<tesseract::TessBaseAPI>()};
+
 hyx::sane_init& sane{hyx::sane_init::get_instance()};
 
 static std::string tmp_path{std::filesystem::temp_directory_path() / "scan2pdf/"};
@@ -83,47 +84,43 @@ int main(int argc, char** argv)
     std::string filename;
     std::string outpath{"./"};
 
-    std::span args(argv, argc);
     // empty
-    if (args.size() == 1) {
+    if (argc == 1) {
         print_help();
         return 0;
     }
-    for (auto arg = args.begin() + 1; arg != args.end(); ++arg) {
-        // -h | --help
-        if (std::strncmp(*arg, "-h", 2) == 0 || std::strncmp(*arg, "--help", 6) == 0) {
+    for (auto idx{1}; idx < argc; ++idx) {
+        auto arg{std::string_view(argv[idx])};
+
+        if ((arg == "-h") || (arg == "--help")) {
             print_help();
             return 0;
         }
-        // -v | --version
-        else if (std::strncmp(*arg, "-v", 2) == 0 || std::strncmp(*arg, "--version", 9) == 0) {
+        else if ((arg == "-v") || (arg == "--version")) {
             print_version();
             return 0;
         }
-        // -r resolution | --resolution
-        else if ((arg + 1 != args.end()) && (std::strncmp(*arg, "-r", 2) == 0 || std::strncmp(*arg, "--resolution", 12) == 0)) {
-            ++arg;
-            sane_options.at(SANE_NAME_SCAN_RESOLUTION) = std::stoi(*arg);
+        else if (((arg == "-r") || (arg == "--resolution")) && ((idx + 1) < argc)) {
+            sane_options.at(SANE_NAME_SCAN_RESOLUTION) = std::atoi(argv[++idx]);
         }
-        // -o outpath | --outpath outpath
-        else if ((arg + 1 != args.end()) && (std::strncmp(*arg, "-o", 2) == 0 || std::strncmp(*arg, "--outpath", 13) == 0)) {
-            ++arg;
-            if (std::filesystem::exists(*arg)) {
-                outpath = std::filesystem::absolute(*arg);
+        else if (((arg == "-o") || (arg == "--outpath")) && ((idx + 1) < argc)) {
+            arg = std::string_view(argv[++idx]);
+            if (std::filesystem::exists(arg)) {
+                outpath = std::filesystem::absolute(arg);
             }
             else {
-                std::cout << "Path " << *arg << " does not exist!\n";
+                std::cout << "Path " << arg << " does not exist!\n";
                 return 1;
             }
         }
         // bad option
-        else if (*arg[0] == '-') {
-            std::cout << "Unkown option \'" << *arg << "\'!\n";
+        else if (arg.starts_with('-')) {
+            std::cout << "Unkown option \'" << arg << "\'!\n";
             return 1;
         }
         // stop at filename
         else {
-            filename = *arg;
+            filename = arg;
             break;
         }
     }
@@ -134,16 +131,25 @@ int main(int argc, char** argv)
     }
 
     try {
-        logger.open(hyx::get_log_path() / "scan2pdf" / "scan2pdf.log");
-        logger.info << "======Starting Program======\n";
+        logger = hyx::logger::get_instance(hyx::get_log_path() / "scan2pdf" / "scan2pdf.log");
+        logger->info << "======Starting Program======\n";
 
-        logger.info << "Initializing components\n";
-        hyx::tess_base_api api(nullptr, "eng");
-        api.get()->SetVariable("debug_file", hyx::get_log_path().append("scan2pdf").append("tess.log").c_str());
+        logger->info << "Initializing components\n";
+        if (api->Init(nullptr, "eng")) {
+            throw std::runtime_error("Could not initialize tesseract");
+        }
+        api->SetVariable("debug_file", hyx::get_log_path().append("scan2pdf").append("tess.log").c_str());
 
-        Magick::InitializeMagick(args.front());
-        MagickCore::SetLogName(hyx::get_log_path().append("magick.log").c_str());
-        logger.info << "All components initialized\n";
+        Magick::InitializeMagick(argv[0]);
+        logger->info << "All components initialized\n";
+    }
+    catch (const std::exception& e) {
+        std::cout << "Failed to Initialize: " << e.what() << '\n';
+        logger->fatal << "Failed to Initialize: " << e.what() << '\n';
+        return 1;
+    }
+
+    try {
 
         hyx::sane_device* device{sane.open_device()};
 
@@ -159,17 +165,19 @@ int main(int argc, char** argv)
                     device->set_option(iop, std::get<SANE_Int>(sane_options.at(opt->name)));
                 }
                 else if (auto sop{dynamic_cast<hyx::sane_device::string_option*>(opt)}) {
-                    device->set_option(sop, std::get<SANE_String_Const>(sane_options.at(opt->name)));
+                    // FIXME: const_cast is a bad idea (but last resort for now).
+                    device->set_option(sop, const_cast<SANE_String>( std::get<SANE_String_Const>(sane_options.at(opt->name))));
                 }
             }
         }
 
+        // TODO: find a way to wrap these with exit_all to create a safe way to cleanup temp files
         if (!std::filesystem::exists(tmp_path)) {
             std::filesystem::create_directory(tmp_path);
         }
 
         // we start processing images
-        logger.info << "Starting processing with filename: \'" << filename << "\'" << '\n';
+        logger->info << "Starting processing with filename: \'" << filename << "\'" << '\n';
         std::vector<Magick::Image> images;
         std::string document_text = "";
         for (size_t i = 0; device->start(); ++i) {
@@ -177,8 +185,10 @@ int main(int argc, char** argv)
 
             dump_image(image, std::to_string(i) + std::to_string(1) + "initial");
 
-            logger.info << "Image " << i << ": Digesting image" << '\n';
+            logger->info << "Image " << i << ": Digesting image" << '\n';
             std::cout << "Digesting Page(" << i + 1 << "):\n";
+
+            // TODO: move most of these blocks to their own functions
 
             // Set image settings
             image.compressType(Magick::LZWCompression);
@@ -188,11 +198,11 @@ int main(int argc, char** argv)
 
             // Find the color of the scan background.
             Magick::Color border_color{image.pixelColor(0, 0)};
-            logger.debug << "Image " << i << ": Setting border color as R: " << rgb_value(border_color.quantumRed()) << " G: " << rgb_value(border_color.quantumGreen()) << " B: " << rgb_value(border_color.quantumBlue()) << '\n';
+            logger->debug << "Image " << i << ": Setting border color as R: " << rgb_value(border_color.quantumRed()) << " G: " << rgb_value(border_color.quantumGreen()) << " B: " << rgb_value(border_color.quantumBlue()) << '\n';
             progress_meter(10, "  Processing image: ");
 
             // Trim the extra blank scan area on the top.
-            logger.info << "Image " << i << ": Removing top scan area" << '\n';
+            logger->info << "Image " << i << ": Removing top scan area" << '\n';
             image.colorFuzz(10.0_quantum_percent);
             image.splice(Magick::Geometry(0, 1), Magick::Color("black"));
             image.trim();
@@ -205,7 +215,7 @@ int main(int argc, char** argv)
             dump_image(image, std::to_string(i) + std::to_string(2) + "top-trim");
 
             // Attempt to deskew image.
-            logger.info << "Image " << i << ": Deskewing image" << '\n';
+            logger->info << "Image " << i << ": Deskewing image" << '\n';
             Magick::Image canny_image{image};
             canny_image.colorSpace(Magick::LinearGRAYColorspace);
             canny_image.artifact("morphology:compose", "lighten");
@@ -221,7 +231,7 @@ int main(int argc, char** argv)
             image.trim();
             image.repage();
             progress_meter(50, "  Processing image: ");
-            logger.debug << "Image " << i << ": Deskewing by " << deskew_angle << " degrees" << '\n';
+            logger->debug << "Image " << i << ": Deskewing by " << deskew_angle << " degrees" << '\n';
 
             dump_image(image, std::to_string(i) + std::to_string(3) + "deskewed");
             dump_image(canny_image, std::to_string(i) + std::to_string(3) + "canny-deskew");
@@ -242,7 +252,7 @@ int main(int argc, char** argv)
             progress_meter(70, "  Processing image: ");
 
             // Remove 1% from the top (and more as-neeed) to remove any shadow left by the first trim.
-            logger.info << "Image " << i << ": Trimming shadow" << '\n';
+            logger->info << "Image " << i << ": Trimming shadow" << '\n';
             image.rotate(180);
             image.chop(Magick::Geometry(0, 10));
             // image.chop(Magick::Geometry(0, std::stoul(image.formatExpression("%h")) * 0.01));
@@ -256,7 +266,7 @@ int main(int argc, char** argv)
 
             std::cout << "  Attempting to reduce file size:\n";
             // Check if the images contain little to no color (fmw42: https://legacy.imagemagick.org/discourse-server/viewtopic.php?t=19580).
-            logger.info << "Image " << i << ": Checking if blank" << '\n';
+            logger->info << "Image " << i << ": Checking if blank" << '\n';
             Magick::Image gray_factor_image{image};
             gray_factor_image.colorSpace(Magick::HSLColorspace);
             double gray_factor = std::stod(gray_factor_image.formatExpression("%[fx:mean.g]"));
@@ -266,12 +276,12 @@ int main(int argc, char** argv)
             pure_bw_image.solarize(50.0_quantum_percent);
             pure_bw_image.colorSpace(Magick::GRAYColorspace);
             auto image_stats{pure_bw_image.statistics().channel(Magick::PixelChannel::GrayPixelChannel)};
-            logger.debug << "Image " << i << ": Gray mean: " << rgb_value(image_stats.mean()) << '\n';
-            logger.debug << "Image " << i << ": Gray std-dev: " << rgb_value(image_stats.standardDeviation()) << '\n';
+            logger->debug << "Image " << i << ": Gray mean: " << rgb_value(image_stats.mean()) << '\n';
+            logger->debug << "Image " << i << ": Gray std-dev: " << rgb_value(image_stats.standardDeviation()) << '\n';
             if (rgb_value(image_stats.mean()) < (255.0 / 4.0) && rgb_value(image_stats.standardDeviation() - image_stats.mean()) < 15) {
                 gray_factor = 0.0000005;
             }
-            logger.debug << "Image " << i << ": Gray Factor: " << gray_factor << '\n';
+            logger->debug << "Image " << i << ": Gray Factor: " << gray_factor << '\n';
 
             // Adjust gamma to correct values.
             image.gamma(2.2);
@@ -283,7 +293,7 @@ int main(int argc, char** argv)
                 // Adjust contrast and fill background.
                 image.brightnessContrast(0, 30);
                 image.opaque(Magick::Color("white"), Magick::Color("white"));
-                logger.debug << "Image " << i << ": increasing contrast" << '\n';
+                logger->debug << "Image " << i << ": increasing contrast" << '\n';
             }
 
             if (gray_factor < 0) {
@@ -291,12 +301,12 @@ int main(int argc, char** argv)
                 // TODO: brighten image and replace whites before thresholding
                 // image.brightnessContrast(0, 20);
                 image.autoThreshold(Magick::KapurThresholdMethod);
-                logger.debug << "Image " << i << ": applying threshold" << '\n';
+                logger->debug << "Image " << i << ": applying threshold" << '\n';
             }
             else if (gray_factor < 0.00055) {
                 // Additionally, convert to grayscale.
                 image.colorSpace(Magick::LinearGRAYColorspace);
-                logger.debug << "Image " << i << ": converting to greyscale color space" << '\n';
+                logger->debug << "Image " << i << ": converting to greyscale color space" << '\n';
             }
 
             dump_image(image, std::to_string(i) + std::to_string(8) + "reduced");
@@ -308,9 +318,9 @@ int main(int argc, char** argv)
 
             // Ask user if almost white images should be deleted.
             bool keep_image{true};
-            logger.debug << "Image " << i << ": Percent white: " << perc_white << '\n';
+            logger->debug << "Image " << i << ": Percent white: " << perc_white << '\n';
             if (perc_white > 0.98) {
-                logger.info << "Image " << i << ": May be blank" << '\n';
+                logger->info << "Image " << i << ": May be blank" << '\n';
 
                 std::string uans;
                 std::cout << "  Possible blank page found (pg. " << i + 1 << "). Keep the page? [Y/n] ";
@@ -319,12 +329,12 @@ int main(int argc, char** argv)
                 if (!uans.empty() && (uans.front() == 'N' || uans.front() == 'n')) {
                     // Although we don't really 'remove' the image here, it is still implicitly destroyed.
                     std::cout << "  Removing page: " << i + 1 << '\n';
-                    logger.info << "Image " << i << ": Removing image" << '\n';
+                    logger->info << "Image " << i << ": Removing image" << '\n';
                     keep_image = false;
                 }
                 else {
                     std::cout << "  Keeping page: " << i + 1 << '\n';
-                    logger.info << "Image " << i << ": Keeping image" << '\n';
+                    logger->info << "Image " << i << ": Keeping image" << '\n';
                 }
             }
             else {
@@ -338,27 +348,27 @@ int main(int argc, char** argv)
                 // Attempt to orient using tesseract.
                 std::cout << "  Attempting to re-orient image: ";
                 Pix* pimage = pixReadMemTiff(static_cast<const unsigned char*>(bimage.data()), bimage.length(), 0);
-                api.get()->SetImage(pimage);
+                api->SetImage(pimage);
 
                 int ori_deg;
                 float ori_conf;
                 const char* script_name;
                 float script_conf;
-                logger.info << "Image " << i << ": Reorienting" << '\n';
-                api.get()->DetectOrientationScript(&ori_deg, &ori_conf, &script_name, &script_conf);
+                logger->info << "Image " << i << ": Reorienting" << '\n';
+                api->DetectOrientationScript(&ori_deg, &ori_conf, &script_name, &script_conf);
 
-                logger.debug << "Image " << i << ": Rotating by " << ori_deg << " degrees" << '\n';
+                logger->debug << "Image " << i << ": Rotating by " << ori_deg << " degrees" << '\n';
                 image.rotate(360 - ori_deg);
                 std::cout << "Rotated image " << ori_deg << " degrees.\n";
 
-                logger.info << "Image " << i << ": Collecting text" << '\n';
+                logger->info << "Image " << i << ": Collecting text" << '\n';
                 pimage = pixRotateOrth(pimage, ori_deg / 90);
-                api.get()->SetImage(pimage);
-                document_text += api.get()->GetUTF8Text();
+                api->SetImage(pimage);
+                document_text += api->GetUTF8Text();
 
                 pixDestroy(&pimage);
 
-                logger.info << "Image " << i << ": Adding to list of images" << '\n';
+                logger->info << "Image " << i << ": Adding to list of images" << '\n';
                 images.push_back(image);
             }
         }
@@ -367,21 +377,21 @@ int main(int argc, char** argv)
             throw std::runtime_error("Too few images to output a pdf.");
         }
 
-        logger.info << "Starting to process pdf" << '\n';
+        logger->info << "Starting to process pdf" << '\n';
         std::cout << "Converting to a searchable PDF: ";
         Magick::writeImages(images.begin(), images.end(), tmp_path + filename + ".tiff");
 
         std::string filedate{hyx::parser::parse_date(document_text, get_curent_date())};
-        logger.debug << "Setting date to \'" << filedate << "\'" << '\n';
+        logger->debug << "Setting date to \'" << filedate << "\'" << '\n';
 
         std::string filestore{hyx::parser::parse_store(document_text, "<store>")};
-        logger.debug << "Setting store to \'" << filestore << "\'" << '\n';
+        logger->debug << "Setting store to \'" << filestore << "\'" << '\n';
 
         std::string filetransaction{hyx::parser::parse_transaction(document_text, "<transaction>")};
-        logger.debug << "Setting transaction to \'" << filetransaction << "\'" << '\n';
+        logger->debug << "Setting transaction to \'" << filetransaction << "\'" << '\n';
 
-        std::unique_ptr<tesseract::TessPDFRenderer> renderer{new tesseract::TessPDFRenderer(std::string(tmp_path + filename).c_str(), api.get()->GetDatapath(), false)};
-        if (!api.get()->ProcessPages(std::string(tmp_path + filename + ".tiff").c_str(), nullptr, 5000, renderer.get())) {
+        std::unique_ptr<tesseract::TessPDFRenderer> renderer{new tesseract::TessPDFRenderer(std::string(tmp_path + filename).c_str(), api->GetDatapath(), false)};
+        if (!api->ProcessPages(std::string(tmp_path + filename + ".tiff").c_str(), nullptr, 5000, renderer.get())) {
             throw std::runtime_error("Could not write output file.");
         }
 
@@ -390,18 +400,18 @@ int main(int argc, char** argv)
         std::error_code ecode;
         std::filesystem::rename(tmp_path + filename + ".pdf", outpath + newFileName, ecode);
         if (ecode.value() != 0) {
-            logger.warning << "Failed to move output file by renaming: \'" << ecode.message() << "\' -> Trying copy instead" << '\n';
+            logger->warning << "Failed to move output file by renaming: \'" << ecode.message() << "\' -> Trying copy instead" << '\n';
             if (!std::filesystem::copy_file(tmp_path + filename + ".pdf", outpath + newFileName, std::filesystem::copy_options::update_existing, ecode)) {
                 throw std::runtime_error("Failed to move or copy output file: \'" + ecode.message() + "\'");
             }
         }
-        logger.debug << "Moved file successfully" << '\n';
+        logger->debug << "Moved file successfully" << '\n';
 
         std::cout << "Document ready!\n";
     }
     catch (const std::exception& e) {
         std::cout << e.what() << "\n";
-        logger.error << e.what() << '\n';
+        logger->error << e.what() << '\n';
 
         exit_all();
         return 1;
@@ -523,9 +533,9 @@ void exit_all()
 {
     std::uintmax_t ndeleted = std::filesystem::remove_all(tmp_path);
     if (ndeleted == 0) {
-        logger.warning << "Could not delete temporary files" << '\n';
+        logger->warning << "Could not delete temporary files" << '\n';
     }
     else {
-        logger.debug << "Deleted " << ndeleted << " temporary files" << '\n';
+        logger->debug << "Deleted " << ndeleted << " temporary files" << '\n';
     }
 }
