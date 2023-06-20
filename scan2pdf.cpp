@@ -11,7 +11,9 @@
 #include <concepts>
 #include <cstdlib>
 #include <filesystem>
+#include <guess_organization.h>
 #include <hytrax/hyx_filesystem.h>
+#include <hytrax/hyx_leptonica.h>
 #include <hytrax/hyx_logger.h>
 #include <hytrax/hyx_parser.h>
 #include <hytrax/hyx_sane.h>
@@ -38,7 +40,7 @@
 #include <tiffio.hxx> // non-standard
 #endif                // !HAVE_LIBTIFF
 
-constexpr static std::string_view version{"2.0.c.2"};
+constexpr static std::string_view version{"2.0.c.3"};
 
 // our logger needs to be global so we can call it from anywhere.
 hyx::logger* logger;
@@ -55,10 +57,9 @@ static std::unordered_map<std::string, std::any> sane_options{
     {"ald", true}};
 
 long double operator""_quantum_percent(long double percent);
+long double operator"" _quantum_percent(unsigned long long percent);
 
 constexpr long double rgb_value(long double quantum_val);
-
-void progress_meter(int percent_time, const std::string& prefix = "", const std::string& postfix = "");
 
 std::string get_curent_date();
 
@@ -73,6 +74,7 @@ void trim_shadow(Magick::Image& image);
 void deskew(Magick::Image& image);
 void trim_edges(Magick::Image& image);
 void transform_to_bw(Magick::Image& image);
+void transform_with_text_to_bw(Magick::Image& image);
 void transform_to_grayscale(Magick::Image& image);
 int get_orientation(tesseract::TessBaseAPI* tess_api, PIX* pimage);
 bool is_grayscale(Magick::Image& image);
@@ -81,17 +83,19 @@ bool is_spot_colored(Magick::Image& image);
 bool is_white(Magick::Image& image);
 bool has_text(tesseract::TessBaseAPI* tess_api, PIX* pimage);
 PIX* magick2pix(Magick::Image& image);
+std::string get_text(tesseract::TessBaseAPI* tess_api, PIX* pimage);
 
-// static void dump_image(Magick::Image& img, const std::string& name)
-// {
-// #ifdef DEBUG
-//     img.write(hyx::log_path() / "scan2pdf" / ("debugged_image_" + name + ".jpg"));
-// #endif
-// }
+static void dump_image(Magick::Image& img, const std::string& name)
+{
+#ifdef DEBUG
+    img.write(hyx::log_path() / "scan2pdf" / ("debugged_image_" + name + ".png"));
+#endif
+}
 
 int main(int argc, char** argv)
 {
-    std::filesystem::path outfile;
+    std::string filename;
+    auto auto_mode{false};
     std::filesystem::path outpath{"./"};
     const hyx::temporary_path tmppath{std::filesystem::temp_directory_path() / "scan2pdf"};
     std::filesystem::path logpath{hyx::log_path() / "scan2pdf"};
@@ -125,19 +129,22 @@ int main(int argc, char** argv)
                 return 1;
             }
         }
+        else if (arg == "--auto") {
+            auto_mode = true;
+        }
         // bad option
         else if (arg.starts_with('-')) {
             std::cout << "Unkown option \'" << arg << "\'!\n";
             return 1;
         }
-        // stop at outfile
+        // stop at filename
         else {
-            outfile = arg;
+            filename = arg;
             break;
         }
     }
 
-    if (outfile.empty()) {
+    if (filename.empty() && !auto_mode) {
         std::cout << "No filename detected!\n";
         return 1;
     }
@@ -184,14 +191,14 @@ int main(int argc, char** argv)
         }
 
         // we start processing images
-        logger->info << "Starting processing with filename: " << std::quoted(outfile.c_str()) << '\n';
+        logger->info << "Scanning Document" << '\n';
         std::vector<Magick::Image> images{};
         std::string document_text{};
         for (auto i = 0; device->start(); ++i) {
             Magick::Image image{get_next_image(device)};
             logger->push_prefix("Image " + std::to_string(i));
 
-            // dump_image(image,  std::to_string(1) + std::string(image.perceptualHash()) + "initial");
+            dump_image(image, std::to_string(1) + "initial" + std::to_string(rand()));
 
             logger->info << "Digesting image" << '\n';
             std::cout << "Digesting Page(" << i + 1 << "):\n";
@@ -199,39 +206,20 @@ int main(int argc, char** argv)
             // Set image settings
             image.compressType(Magick::LZWCompression);
             image.density(std::any_cast<SANE_Word>(sane_options.at(SANE_NAME_SCAN_RESOLUTION)));
-            progress_meter(0, "  Processing image: ");
-
-            // Trim the extra blank scan area on the top.
-            trim_shadow(image);
-            progress_meter(20, "  Processing image: ");
 
             // Attempt to deskew image.
             deskew(image);
-            progress_meter(70, "  Processing image: ");
 
             // Remove the scanner edges from the image
             trim_edges(image);
-            progress_meter(100, "  Processing image: ");
 
             // Adjust gamma to correct values.
             image.gamma(2.2);
             image.enhance();
 
-            // dump_image(image, std::to_string(7) + std::string(image.perceptualHash()) + "enhanced");
+            dump_image(image, std::to_string(7) + "enhanced" + std::to_string(i));
 
             std::cout << "  Attempting to reduce file size:\n";
-            // TODO: magick in.png -resize 200% -level 20 -unsharp 0x6+1.5 -blur 0x2 -auto-threshold Otsu -rotate 180 out.png
-            if (is_bw(image)) {
-                // if (has_text(tess_api.get(), magick2pix(image))) {
-
-                // }
-                transform_to_bw(image);
-            }
-            else if (is_grayscale(image)) {
-                transform_to_grayscale(image);
-            }
-
-            // dump_image(image, std::to_string(8) + std::string(image.perceptualHash()) + "reduced");
 
             // Ask user if almost white images should be deleted.
             auto keep_image{true};
@@ -258,23 +246,32 @@ int main(int argc, char** argv)
             }
 
             if (keep_image) {
-                auto* pimage = magick2pix(image);
+                if (is_bw(image)) {
+                    has_text(tess_api.get(), hyx::unique_pix(magick2pix(image)).get()) ? transform_with_text_to_bw(image) : transform_to_bw(image);
+                }
+                else if (is_grayscale(image)) {
+                    transform_to_grayscale(image);
+                }
+                else {
+                    image.resize("200%");
+                }
+
+                dump_image(image, std::to_string(8) + "reduced" + std::to_string(rand()));
+
+                hyx::unique_pix pimage{magick2pix(image)};
 
                 // Attempt to orient using tesseract.
                 std::cout << "  Attempting to re-orient image: ";
 
-                auto ori_deg{get_orientation(tess_api.get(), pimage)};
+                auto ori_deg{get_orientation(tess_api.get(), pimage.get())};
 
                 logger->debug << "Rotating by " << ori_deg << " degrees" << '\n';
                 std::cout << "Rotated image " << ori_deg << " degrees.\n";
                 image.rotate(360 - ori_deg);
 
                 logger->info << "Collecting text" << '\n';
-                pimage = pixRotateOrth(pimage, ori_deg / 90);
-                tess_api->SetImage(pimage);
-                document_text += tess_api->GetUTF8Text();
-
-                pixDestroy(&pimage);
+                pimage.reset(pixRotateOrth(pimage.get(), ori_deg / 90));
+                document_text += get_text(tess_api.get(), pimage.get());
 
                 logger->info << "Adding to list of images" << '\n';
                 images.push_back(image);
@@ -287,9 +284,20 @@ int main(int argc, char** argv)
             throw std::runtime_error("Too few images to output a pdf.");
         }
 
+        std::string combined_pages_filepath{(tmppath / "combined_pages")};
+
         logger->info << "Starting to process pdf" << '\n';
         std::cout << "Converting to a searchable PDF: ";
-        Magick::writeImages(images.begin(), images.end(), (tmppath / outfile).string() + ".tiff");
+        Magick::writeImages(images.begin(), images.end(), combined_pages_filepath + ".tiff");
+
+        if (auto_mode && !document_text.empty()) {
+            filename = guess_organization({document_text});
+        }
+        else {
+            filename = "<name>";
+        }
+        logger->debug << "Setting name to \'" << filename << "\'" << '\n';
+
 
         std::string filedate{hyx::parser::parse_date(document_text, get_curent_date())};
         logger->debug << "Setting date to \'" << filedate << "\'" << '\n';
@@ -300,22 +308,21 @@ int main(int argc, char** argv)
         std::string filetransaction{hyx::parser::parse_transaction(document_text, "<transaction>")};
         logger->debug << "Setting transaction to \'" << filetransaction << "\'" << '\n';
 
-        if (!tess_api->ProcessPages(((tmppath / outfile).string() + ".tiff").c_str(), nullptr, 5000, std::make_unique<tesseract::TessPDFRenderer>((tmppath / outfile).c_str(), tess_api->GetDatapath(), false).get())) {
+        if (!tess_api->ProcessPages((combined_pages_filepath + ".tiff").c_str(), nullptr, 5000, std::make_unique<tesseract::TessPDFRenderer>(combined_pages_filepath.c_str(), tess_api->GetDatapath(), false).get())) {
             throw std::runtime_error("Could not write output file.");
         }
 
-        std::string newFileName = filedate + "_" + outfile.string() + "_" + filestore + "_" + filetransaction + ".pdf";
+        std::string newFileName = filedate + "_" + filename + "_" + filestore + "_" + filetransaction + ".pdf";
 
         std::error_code ecode;
-        std::filesystem::rename((tmppath / outfile).string() + ".pdf", outpath / newFileName, ecode);
+        std::filesystem::rename(combined_pages_filepath + ".pdf", outpath / newFileName, ecode);
         if (ecode.value() != 0) {
             logger->warning << "Failed to move output file by renaming: \'" << ecode.message() << "\' -> Trying copy instead" << '\n';
-            if (!std::filesystem::copy_file((tmppath / outfile).string() + ".pdf", outpath / newFileName, std::filesystem::copy_options::update_existing, ecode)) {
+            if (!std::filesystem::copy_file(combined_pages_filepath + ".pdf", outpath / newFileName, std::filesystem::copy_options::update_existing, ecode)) {
                 throw std::runtime_error("Failed to move or copy output file: \'" + ecode.message() + "\'");
             }
         }
         logger->debug << "Moved file successfully" << '\n';
-
     }
     catch (const std::exception& e) {
         std::cout << e.what() << "\n";
@@ -341,40 +348,14 @@ long double operator""_quantum_percent(long double percent)
     return ((percent > 1.0l) ? (percent / 100.0l) : percent) * QuantumRange;
 }
 
-void progress_meter(int percent_time, const std::string& prefix, const std::string& postfix)
+long double operator""_quantum_percent(unsigned long long percent)
 {
-    int max_time{40};
-
-    if (percent_time < 0 || percent_time > 100) {
-        throw std::invalid_argument("Percentage must be between 0% and 100%");
-    }
-
-    int scaled_time{percent_time * max_time / 100};
-
-    std::cout << '\r' << prefix << "[";
-
-    for (int i = 0; i < max_time; ++i) {
-        if (i < scaled_time) {
-            std::cout << '#';
-        }
-        else {
-            std::cout << '-';
-        }
-    }
-
-    std::cout << ']' << " " << percent_time << '%' << postfix;
-
-    if (scaled_time == max_time) {
-        std::cout << '\n';
-    }
-
-    // flush to ensure each progress line prints all at once
-    std::cout.flush();
+    return ((percent > 1.0l) ? (percent / 100.0l) : percent) * QuantumRange;
 }
 
 std::string get_curent_date()
 {
-    auto date_length{13};
+    auto date_length{10};
     std::string date;
     date.resize(date_length);
     auto raw_time{std::time(nullptr)};
@@ -465,7 +446,7 @@ void set_device_options(hyx::sane_device* device)
 void trim_shadow(Magick::Image& image)
 {
     logger->info << "Removing top scan shadow" << '\n';
-    image.colorFuzz(10.0_quantum_percent);
+    image.colorFuzz(10_quantum_percent);
     image.splice(Magick::Geometry(0, 1), Magick::Color("black"));
     image.trim();
     image.repage();
@@ -473,7 +454,7 @@ void trim_shadow(Magick::Image& image)
     image.repage();
     image.colorFuzz(0.0);
 
-    // dump_image(image, std::to_string(2) + std::string(image.perceptualHash()) + "top-trim");
+    dump_image(image, std::to_string(2) + "top-trim" + std::to_string(rand()));
 }
 
 void deskew(Magick::Image& image)
@@ -488,8 +469,8 @@ void deskew(Magick::Image& image)
     canny_image.artifact("morphology:compose", "lighten");
     canny_image.morphology(Magick::ConvolveMorphology, Magick::RobertsKernel, "@");
     canny_image.negate();
-    canny_image.threshold(80.0_quantum_percent);
-    canny_image.deskew(80.0_quantum_percent);
+    canny_image.threshold(80_quantum_percent);
+    canny_image.deskew(80_quantum_percent);
 
     image.backgroundColor(border_color);
     double deskew_angle = std::stod(canny_image.formatExpression("%[deskew:angle]"), nullptr);
@@ -500,39 +481,54 @@ void deskew(Magick::Image& image)
     image.repage();
     logger->debug << "Deskewing by " << deskew_angle << " degrees" << '\n';
 
-    // dump_image(image, std::to_string(3) + std::string(image.perceptualHash()) + "deskewed");
-    // dump_image(canny_image, std::to_string(3) + std::string(canny_image.perceptualHash()) + "canny-deskew");
+    dump_image(image, std::to_string(3) + "deskewed" + std::to_string(rand()));
+    dump_image(canny_image, std::to_string(3) + "canny-deskew" + std::to_string(rand()));
 }
 
 void trim_edges(Magick::Image& image)
 {
-    // Remove the scan edges
-    Magick::Image canny_image{image};
-    canny_image.colorSpace(Magick::LinearGRAYColorspace);
-    canny_image.artifact("morphology:compose", "lighten");
-    canny_image.morphology(Magick::ConvolveMorphology, Magick::RobertsKernel, "@");
-    canny_image.negate();
-    canny_image.threshold(87.0_quantum_percent);
-    canny_image.shave("1x1"); // remove black border
+    logger->info << "Trimming edges" << '\n';
 
-    // dump_image(canny_image, std::to_string(4) + std::string(canny_image.perceptualHash()) + "canny-before-trim");
+    // magick \( in.png -alpha off -brightness-contrast 0x10 \) \( -clone 0 -morphology close rectangle:1x50 -negate +write tmp1.png \) \( -clone 0 -morphology close rectangle:50x1 -negate +write tmp2.png \) \( -clone 1 -clone 2 -evaluate-sequence add +write tmp3.png \) -delete 1,2 -compose plus -composite result.png && magick result.png -threshold 95% -define trim:percent-background=95% -trim +repage result-trimed.png
 
-    canny_image.artifact("trim:background-color", "white");
-    canny_image.artifact("trim:percent-background", "99.7%");
-    canny_image.trim();
-    image.crop(canny_image.formatExpression("%wx%h%X+%Y"));
+    Magick::Image image_no_alpha{image};
+    image_no_alpha.alpha(false);
+    image_no_alpha.brightnessContrast(0, 10);
+
+    dump_image(image_no_alpha, std::to_string(4) + "before_line_remove" + std::to_string(rand()));
+
+    Magick::Image image_vertical_lines{image_no_alpha};
+    image_vertical_lines.morphology(Magick::CloseMorphology, Magick::RectangleKernel, "1x50");
+    image_vertical_lines.negate();
+
+    dump_image(image_vertical_lines, std::to_string(4) + "vertical_lines" + std::to_string(rand()));
+
+    Magick::Image image_horizontal_lines{image_no_alpha};
+    image_horizontal_lines.morphology(Magick::CloseMorphology, Magick::RectangleKernel, "50x1");
+    image_horizontal_lines.negate();
+
+    dump_image(image_horizontal_lines, std::to_string(4) + "horizontal_lines" + std::to_string(rand()));
+
+    // we combine both vertical and horizontal lines into one image
+    Magick::Image image_lines;
+    std::vector line_images{image_vertical_lines, image_horizontal_lines};
+    Magick::evaluateImages(&image_lines, line_images.begin(), line_images.end(), Magick::AddEvaluateOperator);
+
+    dump_image(image_lines, std::to_string(4) + "combined_lines" + std::to_string(rand()));
+
+    // now we place the origional image over the inverted lines to remove them
+    image_lines.composite(image, "0x0", Magick::PlusCompositeOp);
+
+    dump_image(image_lines, std::to_string(4) + "lines_removed" + std::to_string(rand()));
+
+    image_lines.threshold(95_quantum_percent);
+    image_lines.artifact("trim:background-color", "white");
+    image_lines.artifact("trim:percent-background", "95");
+    image_lines.trim();
+    image.crop(image_lines.formatExpression("%wx%h%X+%Y"));
     image.repage();
 
-    // Remove 1% from the top (and more as-needed) to remove any shadow left by the first trim.
-    logger->info << "Trimming shadow" << '\n';
-    image.rotate(180);
-    image.chop(Magick::Geometry(0, 10));
-    // image.chop(Magick::Geometry(0, std::stoul(image.formatExpression("%h")) * 0.01));
-    image.rotate(180);
-    image.repage();
-
-    // dump_image(image, std::to_string(4) + std::string(image.perceptualHash()) + "normal");
-    // dump_image(canny_image, std::to_string(4) + std::string(canny_image.perceptualHash()) + "canny");
+    dump_image(image, std::to_string(4) + "normal" + std::to_string(rand()));
 }
 
 void transform_to_bw(Magick::Image& image)
@@ -541,6 +537,19 @@ void transform_to_bw(Magick::Image& image)
 
     image.brightnessContrast(0, 30);
     image.autoThreshold(Magick::KapurThresholdMethod);
+    image.resize("200%");
+}
+
+void transform_with_text_to_bw(Magick::Image& image)
+{
+    logger->debug << "Converting to black and white" << '\n';
+
+    // magick in.png -auto-level -unsharp 0x2+1.5+0.05 -resize 200% -auto-threshold otsu out.pdf
+
+    image.autoLevel();
+    image.unsharpmask(0, 2, 1.5, 0.05);
+    image.resize("200%");
+    image.autoThreshold(Magick::OTSUThresholdMethod);
 }
 
 void transform_to_grayscale(Magick::Image& image)
@@ -550,6 +559,7 @@ void transform_to_grayscale(Magick::Image& image)
     image.brightnessContrast(0, 30);
     image.opaque(Magick::Color("white"), Magick::Color("white"));
     image.colorSpace(Magick::LinearGRAYColorspace);
+    image.resize("200%");
 }
 
 int get_orientation(tesseract::TessBaseAPI* tess_api, PIX* pimage)
@@ -593,20 +603,22 @@ bool is_bw(Magick::Image& image)
 {
     logger->push_prefix("BW Check");
 
+    // magick in.png -solarize 50% -colorspace gray -identify -verbose info:
+
     Magick::Image bw_image_test{image};
-    bw_image_test.solarize(50.0_quantum_percent);
+    bw_image_test.solarize(50_quantum_percent);
     bw_image_test.colorSpace(Magick::GRAYColorspace);
     auto image_stats{bw_image_test.statistics().channel(Magick::PixelChannel::GrayPixelChannel)};
 
     auto mean_gray{rgb_value(image_stats.mean())};
-    auto std_diff_mean_gray{rgb_value(image_stats.standardDeviation() - image_stats.mean())};
+    auto std_diff_mean_gray{std::abs(rgb_value(image_stats.standardDeviation() - image_stats.mean()))};
 
     logger->debug << "Gray mean: " << mean_gray << '\n';
     logger->debug << "Gray std-dev-mean-diff: " << std_diff_mean_gray << '\n';
 
     logger->pop_prefix();
 
-    if (mean_gray < (255.0 / 4.0) && std_diff_mean_gray < 15) {
+    if (mean_gray < (255.0 / 6.0) && std_diff_mean_gray < 15) {
         return true;
     }
 
@@ -666,4 +678,11 @@ PIX* magick2pix(Magick::Image& image)
     Magick::Blob bimage;
     image.write(&bimage, "tiff");
     return pixReadMemTiff(static_cast<const unsigned char*>(bimage.data()), bimage.length(), 0);
+}
+
+std::string get_text(tesseract::TessBaseAPI* tess_api, PIX* pimage)
+{
+    tess_api->SetImage(pimage);
+    auto ocr_text{std::unique_ptr<char[]>(tess_api->GetUTF8Text())};
+    return (ocr_text) ? ocr_text.get() : "";
 }
