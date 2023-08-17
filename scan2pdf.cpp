@@ -563,9 +563,6 @@ int main(int argc, char** argv)
         Magick::InitializeMagick(*argv);
         hyx::logger.info("All components initialized\n");
 
-        Magick::ResourceLimits::thread(1LL);
-        Magick::ResourceLimits::throttle(20LL);
-
         try {
             // we are just initializing python early so if it fails we know before starting the scan
             std::ignore = hyx::py_init::get_instance().import("guess_organization")->call("guess_organization", std::string("test string with Walmart"));
