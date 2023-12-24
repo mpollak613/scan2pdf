@@ -17,13 +17,13 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
-#include <hytrax/hyx_circular_buffer.h> // non-standard
-#include <hytrax/hyx_filesystem.h>      // non-standard
-#include <hytrax/hyx_leptonica.h>       // non-standard
-#include <hytrax/hyx_logger.h>          // non-standard
-#include <hytrax/hyx_parser.h>          // non-standard
-#include <hytrax/hyx_python.h>          // non-standard
-#include <hytrax/hyx_sane.h>            // non-standard
+#include <hyx/circular_buffer.h> // non-standard
+#include <hyx/filesystem.h>      // non-standard
+#include <hyx/leptonica.h>       // non-standard
+#include <hyx/logger.h>          // non-standard
+#include <hyx/parser.h>          // non-standard
+#include <hyx/python.h>          // non-standard
+#include <hyx/sane.h>            // non-standard
 #include <iostream>
 #include <leptonica/allheaders.h> // non-standard
 #include <limits>
@@ -40,16 +40,20 @@
 #include <unordered_map>
 #include <vector>
 
-// TODO: allow for other image formats if libtiff is not available
+//! TODO: allow for other image formats if libtiff is not available
 #ifdef HAVE_LIBTIFF
 #include <tiffio.h>   // non-standard
 #include <tiffio.hxx> // non-standard
 #endif                // !HAVE_LIBTIFF
 
 namespace global {
-    constexpr std::string_view version{"2.2"};
+    constexpr std::string_view version{"2.3"};
     constexpr auto scanner_gamma_fix{2.2};
 } // namespace global
+
+hyx::logger logger(std::clog, "[cl::utc;%FT%TZ][[[::lvl;^9]]]: [sl::file_name;]@[sl::line;]: ");
+
+//! FIXME: QuantumRange Seems broken? MaxMap works for now.
 
 constexpr double to_quantum_percent(std::convertible_to<double> auto percent);
 constexpr long double quantum_as_rgb(long double quantum_val);
@@ -93,7 +97,7 @@ std::string get_text(tesseract::TessBaseAPI* tess_api, PIX* pimage);
 /**
  * @brief Global options.
  */
-// TODO: global options should get stored in a safer way
+//! TODO: global options should get stored in a safer way
 static std::unordered_map<std::string, std::any> sane_options{
     {SANE_NAME_SCAN_SOURCE, "ADF Duplex"},
     {SANE_NAME_SCAN_MODE, SANE_VALUE_SCAN_MODE_COLOR},
@@ -115,13 +119,13 @@ constexpr void dump_image([[maybe_unused]] Magick::Image& img, [[maybe_unused]] 
 constexpr long double quantum_as_rgb(long double quantum_val)
 {
     constexpr auto rgb_max{255.0L};
-    return (quantum_val / QuantumRange) * rgb_max;
+    return (quantum_val / MaxMap) * rgb_max;
 }
 
 constexpr double to_quantum_percent(std::convertible_to<double> auto percent)
 {
     constexpr auto percent_max{100.0};
-    return (static_cast<double>(percent) / percent_max) * QuantumRange;
+    return (static_cast<double>(percent) / percent_max) * MaxMap;
 }
 
 std::string get_current_date()
@@ -131,10 +135,10 @@ std::string get_current_date()
 
 std::string parse_organization(const std::string& text, const std::string& default_return)
 {
-    if (std::string org{hyx::py_init::get_instance().import("guess_organization")->call("guess_organization", text)}; !org.empty()) {
+    if (std::string org{hyx::py_init::get_instance().import("guess_organization")->call("guess_organization", text)}; !org.empty()) [[likely]] {
         return org;
     }
-    else {
+    else [[unlikely]] {
         return default_return;
     }
 }
@@ -163,17 +167,17 @@ Magick::Image get_next_image(hyx::sane_device* device)
     std::unique_ptr<SANE_Byte, decltype(&_TIFFfree)> data{static_cast<SANE_Byte*>(_TIFFmalloc(buf_size)), &_TIFFfree};
     for (auto row{0u}; device->read(data.get(), buf_size); ++row) {
         if (TIFFWriteScanline(tifffile, data.get(), row) != 1) {
-            hyx::logger.warning("bad write!\n");
+            logger(hyx::logger_literals::warning, "bad write!\n");
             throw std::runtime_error("Bad image write");
         }
     }
 
-    // FIXME: if we throw, the file is not closed
+    //! FIXME: if we throw, the file is not closed
     TIFFClose(tifffile);
 
     // since we read the exact number of bytes per line we don't get EOF until the next call.
     // if the next call doesn't read zero bytes or return EOF, we have image bytes that were not read.
-    if (device->read(data.get(), buf_size)) {
+    if (device->read(data.get(), buf_size)) [[unlikely]] {
         throw std::runtime_error("Remaining bytes after image read");
     }
 
@@ -211,7 +215,7 @@ void set_device_options(hyx::sane_device* device)
                 device->set_option(iop, std::any_cast<SANE_Int>(sane_options.at(opt->name)));
             }
             else if (const auto sop{dynamic_cast<hyx::sane_device::string_option*>(opt)}) {
-                // FIXME: const_cast is a bad idea (but last resort for now).
+                //! FIXME: const_cast is a bad idea (but last resort for now).
                 device->set_option(sop, const_cast<SANE_String>(std::any_cast<SANE_String_Const>(sane_options.at(opt->name))));
             }
         }
@@ -241,20 +245,20 @@ void proccess(Magick::Image& image)
 
 void deskew(Magick::Image& image)
 {
-    hyx::logger.info("Deskewing image\n");
+    logger("Deskewing image\n");
 
     // we flip the image to get the shadow on the top before deskewing
     image.flip();
 
     // Find the color of the scan background.
     const auto background_color{image.pixelColor(5, 5)};
-    hyx::logger.debug("Set background color to ({},{},{})\n", quantum_as_rgb(background_color.quantumRed()), quantum_as_rgb(background_color.quantumGreen()), quantum_as_rgb(background_color.quantumBlue()));
+    logger(hyx::logger_literals::debug, "Set background color to ({},{},{})\n", quantum_as_rgb(background_color.quantumRed()), quantum_as_rgb(background_color.quantumGreen()), quantum_as_rgb(background_color.quantumBlue()));
 
     image.backgroundColor(background_color);
     image.deskew(80_quantum_percent);
 
     const auto deskew_angle{image.formatExpression("%[deskew:angle]")};
-    hyx::logger.debug("Deskewed by {} degrees\n", deskew_angle);
+    logger(hyx::logger_literals::debug, "Deskewed by {} degrees\n", deskew_angle);
 
     // reset image state besides deskewing
     image.flip();
@@ -267,7 +271,7 @@ std::string get_trim_edges_bounds(Magick::Image image)
 {
     // magick in.png -fuzz 10% -set MBB '%[minimum-bounding-box]' -fill black -colorize 100 -fill white -draw "polygon %[MBB]" -define trim:percent-background=0 -trim -format "%wx%h%X%Y" info:
 
-    hyx::logger.info("Trimming edges\n");
+    logger("Trimming edges\n");
 
     // the colorFuzz value will influence the MBR
     image.colorFuzz(10_quantum_percent);
@@ -300,7 +304,7 @@ std::string get_trim_edges_bounds(Magick::Image image)
 
 std::string get_trim_shadow_bounds(Magick::Image image)
 {
-    hyx::logger.info("Trimming shadow\n");
+    logger("Trimming shadow\n");
 
     image.gamma(global::scanner_gamma_fix);
     constexpr auto blur_radius{0.0};
@@ -315,7 +319,7 @@ std::string get_trim_shadow_bounds(Magick::Image image)
     dump_image(image, "trim_shadow_before_trim");
 
     auto image_canvas{image.formatExpression("%wx%h%X%Y")};
-    hyx::logger.debug("Starting dimentions: {}\n", image_canvas);
+    logger(hyx::logger_literals::debug, "Starting dimentions: {}\n", image_canvas);
     try {
         for ([[maybe_unused]] auto _ : std::views::iota(0, 10)) {
             const auto before_trim_image_canvas = image.formatExpression("%wx%h%X%Y");
@@ -323,12 +327,13 @@ std::string get_trim_shadow_bounds(Magick::Image image)
             const auto after_trim_image_canvas = image.formatExpression("%wx%h%X%Y");
 
             // check to see if the trim removed anything
-            hyx::logger.debug("After trim dimentions: {}\n", after_trim_image_canvas);
+            logger(hyx::logger_literals::debug, "After trim dimentions: {}\n", after_trim_image_canvas);
             if (before_trim_image_canvas == after_trim_image_canvas) {
                 // maybe the shadow is not at the edge of the image?
                 // we will try to dig one pixel at a time to find the shadow
-                hyx::logger.debug("Removing pixel line to find shadow\n");
+                logger(hyx::logger_literals::debug, "Removing pixel line to find shadow\n");
                 image.crop("+0-1");
+                image.repage();
             }
             else {
                 image_canvas = after_trim_image_canvas;
@@ -337,7 +342,7 @@ std::string get_trim_shadow_bounds(Magick::Image image)
         }
     }
     catch (const std::exception& e) {
-        hyx::logger.warning("Failed to trim shadow: {}\n", e.what());
+        logger(hyx::logger_literals::warning, "Failed to trim shadow: {}\n", e.what());
     }
 
     dump_image(image, "trim_shadow_after_trim");
@@ -347,7 +352,7 @@ std::string get_trim_shadow_bounds(Magick::Image image)
 
 void transform_to_bw(Magick::Image& image)
 {
-    hyx::logger.debug("Converting to black and white\n");
+    logger(hyx::logger_literals::debug, "Converting to black and white\n");
 
     constexpr auto brightness{0.0};
     constexpr auto constrast{30.0};
@@ -357,7 +362,7 @@ void transform_to_bw(Magick::Image& image)
 
 void transform_with_text_to_bw(Magick::Image& image)
 {
-    hyx::logger.debug("Converting to black and white\n");
+    logger(hyx::logger_literals::debug, "Converting to black and white\n");
 
     // magick in.png -auto-level -unsharp 0x2+1.5+0.05 -resize 200% -auto-threshold otsu out.pdf
 
@@ -372,7 +377,7 @@ void transform_with_text_to_bw(Magick::Image& image)
 
 void transform_to_grayscale(Magick::Image& image)
 {
-    hyx::logger.debug("Converting to greyscale\n");
+    logger(hyx::logger_literals::debug, "Converting to greyscale\n");
 
     constexpr auto brightness{0.0};
     constexpr auto contrast{30.0};
@@ -383,7 +388,7 @@ void transform_to_grayscale(Magick::Image& image)
 
 int get_orientation(tesseract::TessBaseAPI* tess_api, PIX* pimage)
 {
-    hyx::logger.info("Getting orientation\n");
+    logger("Getting orientation\n");
     tess_api->SetImage(pimage);
 
     // default to not changing the orientation
@@ -393,24 +398,22 @@ int get_orientation(tesseract::TessBaseAPI* tess_api, PIX* pimage)
     //// float script_conf;
     tess_api->DetectOrientationScript(&ori_deg, nullptr, nullptr, nullptr);
 
-    hyx::logger.debug("Orientation off by {} degrees\n", ori_deg);
+    logger(hyx::logger_literals::debug, "Orientation off by {} degrees\n", ori_deg);
 
     return ori_deg;
 }
 
 bool is_grayscale(Magick::Image& image)
 {
-    hyx::logger.push_prefix("Grayscale Check");
+    // constinit static const auto log_prefix{"Grayscale Check"};
 
     Magick::Image gray_image_test{image};
     gray_image_test.colorSpace(Magick::HSLColorspace);
     auto gray_factor{std::stod(gray_image_test.formatExpression("%[fx:mean.g]"))};
     auto gray_peak{std::stod(gray_image_test.formatExpression("%[fx:maxima.g]"))};
 
-    hyx::logger.debug("Gray mean: {}\n", gray_factor);
-    hyx::logger.debug("Gray peak: {}\n", gray_peak);
-
-    hyx::logger.pop_prefix();
+    logger(hyx::logger_literals::debug, "Gray mean: {}\n", gray_factor);
+    logger(hyx::logger_literals::debug, "Gray peak: {}\n", gray_peak);
 
     constexpr auto gray_factor_threshold{0.05};
     constexpr auto gray_peak_threshold{0.1};
@@ -423,7 +426,7 @@ bool is_grayscale(Magick::Image& image)
 
 bool is_bw(Magick::Image& image)
 {
-    hyx::logger.push_prefix("BW Check");
+    // constinit static const auto log_prefix{"BW Check"};
 
     // magick in.png -solarize 50% -colorspace gray -identify -verbose info:
 
@@ -435,10 +438,8 @@ bool is_bw(Magick::Image& image)
     auto mean_gray{quantum_as_rgb(image_stats.mean())};
     auto std_diff_mean_gray{std::abs(quantum_as_rgb(image_stats.standardDeviation() - image_stats.mean()))};
 
-    hyx::logger.debug("Gray mean: {}\n", mean_gray);
-    hyx::logger.debug("Gray std-dev-mean-diff: {}\n", std_diff_mean_gray);
-
-    hyx::logger.pop_prefix();
+    logger(hyx::logger_literals::debug, "Gray mean: {}\n", mean_gray);
+    logger(hyx::logger_literals::debug, "Gray std-dev-mean-diff: {}\n", std_diff_mean_gray);
 
     constexpr auto rgb_max{255};
     constexpr auto mean_gray_rgb_threshold{rgb_max / 6};
@@ -452,7 +453,7 @@ bool is_bw(Magick::Image& image)
 
 bool is_spot_colored(Magick::Image& image)
 {
-    hyx::logger.push_prefix("Spot Color Check");
+    // constinit static const auto log_prefix{"Spot Color Check"};
 
     Magick::Image spot_image_test{image};
     spot_image_test.colorSpace(Magick::HCLColorspace);
@@ -460,10 +461,8 @@ bool is_spot_colored(Magick::Image& image)
     auto gray_factor{std::stod(spot_image_test.formatExpression("%[fx:mean.g]"))};
     auto gray_peak{std::stod(spot_image_test.formatExpression("%[fx:maxima.g]"))};
 
-    hyx::logger.debug("Color mean: {}\n", gray_factor);
-    hyx::logger.debug("Color peak: {}\n", gray_peak);
-
-    hyx::logger.pop_prefix();
+    logger(hyx::logger_literals::debug, "Color mean: {}\n", gray_factor);
+    logger(hyx::logger_literals::debug, "Color peak: {}\n", gray_peak);
 
     constexpr auto gray_factor_threshold{0.05};
     constexpr auto gray_peak_min{0.3};
@@ -476,15 +475,13 @@ bool is_spot_colored(Magick::Image& image)
 
 bool is_white(Magick::Image& image)
 {
-    hyx::logger.push_prefix("All White Check");
+    // constinit static const auto log_prefix{"All White Check"};
 
     Magick::Image percent_white_image{image};
     percent_white_image.whiteThreshold("75%");
     auto percent_white = std::stod(percent_white_image.formatExpression("%[fx:mean]"));
 
-    hyx::logger.debug("Percent white: {}\n", percent_white);
-
-    hyx::logger.pop_prefix();
+    logger(hyx::logger_literals::debug, "Percent white: {}\n", percent_white);
 
     constexpr auto percent_white_threshold{0.99};
     if (percent_white > percent_white_threshold) {
@@ -574,9 +571,10 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    const auto prog_start{std::chrono::high_resolution_clock::now()};
     try {
-        hyx::logger.swap_to(logpath / "scan2pdf.log");
-        hyx::logger.info("======Starting Program======\n");
+        logger.swap_to(logpath / "scan2pdf.log");
+        logger("======Starting Program======\n");
     }
     catch (const std::exception& e) {
         std::cout << "WARNING: Failed to open file for logging: " << logpath / "scan2pdf.log" << '\n';
@@ -587,32 +585,45 @@ int main(int argc, char** argv)
     std::unique_ptr<tesseract::TessBaseAPI> tess_api;
 
     try {
-        hyx::logger.info("Initializing components\n");
+        logger("Initializing components\n");
 
-        sane = &hyx::sane_init::get_instance();
+        SANE_Int sane_version{};
+        sane = &hyx::sane_init::get_instance(&sane_version);
+        if (sane_version) [[likely]] {
+            logger(hyx::logger_literals::debug, "Initialized SANE {}.{}.{}\n", SANE_VERSION_MAJOR(sane_version), SANE_VERSION_MINOR(sane_version), SANE_VERSION_BUILD(sane_version));
+        }
+        else [[unlikely]] {
+            logger(hyx::logger_literals::debug, "WARNING: unable to get SANE version\n");
+        }
 
         tess_api = std::make_unique<tesseract::TessBaseAPI>();
         if (tess_api->Init(nullptr, "eng")) {
             throw std::runtime_error("Could not initialize tesseract");
         }
         tess_api->SetVariable("debug_file", (logpath / "tess.log").c_str());
+        logger(hyx::logger_literals::debug, "Initialized Tesseract {}\n", tess_api->Version());
 
         Magick::InitializeMagick(*argv);
-        hyx::logger.info("All components initialized\n");
+        if (!Magick::EnableOpenCL()) {
+            logger(hyx::logger_literals::warning, "GPU acceleration failed to initialize -> falling back to CPU only\n");
+        }
+        logger(hyx::logger_literals::debug, "Initialized {}\n", MagickCore::GetMagickVersion(nullptr));
 
         try {
             // we are just initializing python early so if it fails we know before starting the scan
-            std::ignore = hyx::py_init::get_instance().import("guess_organization")->call("guess_organization", std::string("test string with Walmart"));
+            std::ignore = hyx::py_init::get_instance().import("guess_organization");
         }
         catch (const std::exception& py_e) {
             // don't fail without python init; just continue without things that depend on it
-            hyx::logger.warning("Failed to initialize Python components: {}\n", py_e.what());
+            logger(hyx::logger_literals::warning, "Failed to initialize Python components: {}\n", py_e.what());
             filename = std::regex_replace(filename, std::regex("%o"), "[org]");
         }
+
+        logger("All components initialized\n");
     }
     catch (const std::exception& e) {
         std::cout << "Failed to Initialize: " << e.what() << '\n';
-        hyx::logger.fatal("Failed to Initialize: {}", e.what());
+        logger(hyx::logger_literals::fatal, "Failed to Initialize: {}", e.what());
         return 1;
     }
 
@@ -626,7 +637,7 @@ int main(int argc, char** argv)
         }
 
         // we start processing images
-        hyx::logger.info("Scanning Document\n");
+        logger("Scanning Document\n");
         std::atomic<bool> done_scanning{false};
         hyx::circular_buffer<Magick::Image> images_buffer;
         std::vector<Magick::Image> images;
@@ -636,13 +647,13 @@ int main(int argc, char** argv)
             // we only share the images container and atomic boolean—which gets set as the last thing the thread does—so it should be thread safe
             std::jthread t1([&images_buffer, &device, &done_scanning]() {
                 for (auto i{0}; device->start(); ++i) {
-                    hyx::logger.info("Obtaining image {}\n", i);
+                    logger("Obtaining image {}\n", i);
                     images_buffer.emplace(get_next_image(device));
                 }
 
                 // ok, we are done and images is not empty (unless nothing was scanned)
                 done_scanning = true;
-                hyx::logger.info("Done obtaining images\n");
+                logger("Done obtaining images\n");
             });
 
             for (int img_num{0}; !done_scanning || !images_buffer.empty(); /* empty */) {
@@ -655,10 +666,10 @@ int main(int argc, char** argv)
                     // take and process an image
                     Magick::Image image{images_buffer.take()};
 
-                    hyx::logger.push_prefix("Image " + std::to_string(img_num));
+                    // static const auto log_prefix{"Image " + std::to_string(img_num)};
                     dump_image(image, "initial");
 
-                    hyx::logger.info("Digesting image\n");
+                    logger("Digesting image\n");
 
                     // set image settings
                     image.compressType(Magick::LZWCompression);
@@ -669,21 +680,21 @@ int main(int argc, char** argv)
                     dump_image(image, "proccessed");
 
                     // ask user if almost white images should be deleted.
-                    // FIXME: using a lambda for now
+                    //! FIXME: using a lambda for now
                     auto ask_user_should_keep_image = [&image, &img_num]() -> bool {
                         if (is_white(image)) {
-                            hyx::logger.warning("May be blank\n");
+                            logger(hyx::logger_literals::warning, "May be blank\n");
 
                             std::string user_answer;
                             std::cout << "Possible blank page found (pg. " << img_num << "). Keep the page? [Y/n] ";
                             std::getline(std::cin, user_answer);
 
                             if (!user_answer.empty() && (user_answer.front() == 'N' || user_answer.front() == 'n')) {
-                                hyx::logger.info("Removing image\n");
+                                logger("Removing image\n");
                                 return false;
                             }
                             else {
-                                hyx::logger.info("Keeping image\n");
+                                logger("Keeping image\n");
                                 // fall through
                             }
                         }
@@ -706,18 +717,17 @@ int main(int argc, char** argv)
                         // attempt to orient using tesseract.
                         auto ori_deg{get_orientation(tess_api.get(), pimage.get())};
 
-                        hyx::logger.debug("Rotating by {} degrees\n", ori_deg);
+                        logger(hyx::logger_literals::debug, "Rotating by {} degrees\n", ori_deg);
                         image.rotate(360 - ori_deg);
 
-                        hyx::logger.info("Collecting text\n");
+                        logger("Collecting text\n");
                         pimage.reset(pixRotateOrth(pimage.get(), ori_deg / 90));
                         document_text += get_text(tess_api.get(), pimage.get());
 
-                        hyx::logger.info("Adding to list of images\n");
+                        logger("Adding to list of images\n");
                         images.emplace_back(std::move(image));
                     }
 
-                    hyx::logger.pop_prefix();
                     ++img_num;
                 }
             }
@@ -729,7 +739,7 @@ int main(int argc, char** argv)
 
         std::string combined_pages_filepath{(tmppath / "combined_pages")};
 
-        hyx::logger.info("Starting to process pdf\n");
+        logger("Starting to process pdf\n");
         Magick::writeImages(images.begin(), images.end(), combined_pages_filepath + ".tiff");
 
         if (auto_mode && !document_text.empty()) {
@@ -738,32 +748,31 @@ int main(int argc, char** argv)
             filename = std::regex_replace(filename, std::regex("%s"), hyx::parser::parse_store(document_text, "<store>"));
             filename = std::regex_replace(filename, std::regex("%t"), hyx::parser::parse_transaction(document_text, "<transaction>"));
         }
-        hyx::logger.debug("File name is \'{}\'\n", filename);
+        logger(hyx::logger_literals::debug, "File name is \'{}\'\n", filename);
 
         if (!tess_api->ProcessPages((combined_pages_filepath + ".tiff").c_str(), nullptr, static_cast<int>(10'000 * images_buffer.size()), std::make_unique<tesseract::TessPDFRenderer>(combined_pages_filepath.c_str(), tess_api->GetDatapath(), false).get())) {
-            hyx::logger.warning("OCR taking too long: skipping\n");
+            logger(hyx::logger_literals::warning, "OCR taking too long: skipping\n");
             Magick::writeImages(images.begin(), images.end(), (combined_pages_filepath + ".pdf"));
         }
 
         std::error_code ecode;
-        std::filesystem::rename(combined_pages_filepath + ".pdf", outpath / (filename + ".pdf"), ecode);
-        if (ecode.value() != 0) {
-            hyx::logger.warning("Failed to move output file by renaming: \'{}\' -> Trying copy instead\n", ecode.message());
-            if (!std::filesystem::copy_file(combined_pages_filepath + ".pdf", outpath / (filename + ".pdf"), std::filesystem::copy_options::update_existing, ecode)) {
-                throw std::runtime_error("Failed to move or copy output file: \'" + ecode.message() + "\'");
-            }
+        if (!std::filesystem::copy_file(combined_pages_filepath + ".pdf", outpath / (filename + ".pdf"), std::filesystem::copy_options::update_existing, ecode)) {
+            throw std::runtime_error("Failed to move output file: \'" + ecode.message() + "\'");
         }
-        hyx::logger.debug("Moved file successfully\n");
+        logger(hyx::logger_literals::debug, "Moved file successfully\n");
+
+        logger("Document ready!\n");
     }
     catch (const std::exception& e) {
         std::cout << e.what() << "\n";
-        hyx::logger.error("{}\n", e.what());
+        logger(hyx::logger_literals::error, "{}\n", e.what());
         return 1;
     }
     // catch (const Magick::Error& me) {
     //     // return 2;
     // }
 
-    hyx::logger.info("Document ready!\n");
+    const auto prog_end{std::chrono::high_resolution_clock::now()};
+    logger(hyx::logger_literals::debug, "finished in {:%Q%q}\n", std::chrono::duration_cast<std::chrono::milliseconds>(prog_end - prog_start));
     return 0;
 }
