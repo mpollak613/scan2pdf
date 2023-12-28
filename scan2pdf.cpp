@@ -47,7 +47,7 @@
 #endif                // !HAVE_LIBTIFF
 
 namespace global {
-    constexpr std::string_view version{"2.3"};
+    constexpr std::string_view version{"2.4"};
     constexpr auto scanner_gamma_fix{2.2};
 } // namespace global
 
@@ -55,16 +55,17 @@ hyx::logger logger(std::clog, "[cl::utc;%FT%TZ][[[::lvl;^9]]]: [sl::file_name;]@
 
 //! FIXME: QuantumRange Seems broken? MaxMap works for now.
 
-constexpr double to_quantum_percent(std::convertible_to<double> auto percent);
+constexpr double percent_to_quantum(std::convertible_to<double> auto percent);
+constexpr double quantum_to_percent(std::convertible_to<double> auto quantum);
 constexpr long double quantum_as_rgb(long double quantum_val);
 
 consteval double operator""_quantum_percent(long double percent)
 {
-    return to_quantum_percent(percent);
+    return percent_to_quantum(percent);
 }
 consteval double operator"" _quantum_percent(unsigned long long percent)
 {
-    return to_quantum_percent(percent);
+    return percent_to_quantum(percent);
 }
 
 std::string get_current_date();
@@ -86,10 +87,9 @@ void transform_to_bw(Magick::Image& image);
 void transform_with_text_to_bw(Magick::Image& image);
 void transform_to_grayscale(Magick::Image& image);
 int get_orientation(tesseract::TessBaseAPI* tess_api, PIX* pimage);
-bool is_grayscale(Magick::Image& image);
-bool is_bw(Magick::Image& image);
-bool is_spot_colored(Magick::Image& image);
-bool is_white(Magick::Image& image);
+bool is_grayscale(Magick::Image image);
+bool is_bw(Magick::Image image);
+bool is_white(Magick::Image image);
 bool has_text(tesseract::TessBaseAPI* tess_api, PIX* pimage);
 PIX* magick2pix(Magick::Image& image);
 std::string get_text(tesseract::TessBaseAPI* tess_api, PIX* pimage);
@@ -111,7 +111,7 @@ constexpr void dump_image([[maybe_unused]] Magick::Image& img, [[maybe_unused]] 
 #ifdef DEBUG
     static int idx{};
 
-    img.write(hyx::log_path() / "scan2pdf" / ("debugged_image_" + std::to_string(idx) + name + ".png"));
+    img.write(hyx::home_path() / "Downloads/tmp" / ("debugged_image_" + std::to_string(idx) + name + ".png"));
     ++idx;
 #endif
 }
@@ -122,10 +122,16 @@ constexpr long double quantum_as_rgb(long double quantum_val)
     return (quantum_val / MaxMap) * rgb_max;
 }
 
-constexpr double to_quantum_percent(std::convertible_to<double> auto percent)
+constexpr double percent_to_quantum(std::convertible_to<double> auto percent)
 {
     constexpr auto percent_max{100.0};
     return (static_cast<double>(percent) / percent_max) * MaxMap;
+}
+
+constexpr double quantum_to_percent(std::convertible_to<double> auto quantum)
+{
+    constexpr auto percent_max{100.0};
+    return (static_cast<double>(quantum) / MaxMap) * percent_max;
 }
 
 std::string get_current_date()
@@ -313,7 +319,7 @@ std::string get_trim_shadow_bounds(Magick::Image image)
     image.negate();
     image.autoThreshold(Magick::OTSUThresholdMethod);
     image.negate();
-    image.artifact("trim:percent-background", "0");
+    image.artifact("trim:percent-background", "5");
     image.artifact("trim:background-color", "black");
 
     dump_image(image, "trim_shadow_before_trim");
@@ -403,83 +409,67 @@ int get_orientation(tesseract::TessBaseAPI* tess_api, PIX* pimage)
     return ori_deg;
 }
 
-bool is_grayscale(Magick::Image& image)
+bool is_grayscale(Magick::Image image)
 {
     // constinit static const auto log_prefix{"Grayscale Check"};
 
-    Magick::Image gray_image_test{image};
-    gray_image_test.colorSpace(Magick::HSLColorspace);
-    auto gray_factor{std::stod(gray_image_test.formatExpression("%[fx:mean.g]"))};
-    auto gray_peak{std::stod(gray_image_test.formatExpression("%[fx:maxima.g]"))};
+    // magick in.png -colorspace HSB -resize 2% -format "%[fx:mean.g] %[fx:maxima.g]\n" info:-
 
-    logger(hyx::logger_literals::debug, "Gray mean: {}\n", gray_factor);
-    logger(hyx::logger_literals::debug, "Gray peak: {}\n", gray_peak);
+    image.colorSpace(Magick::HSBColorspace);
+    image.resize("2%");
 
-    constexpr auto gray_factor_threshold{0.05};
-    constexpr auto gray_peak_threshold{0.1};
-    if (gray_factor < gray_factor_threshold && gray_peak < gray_peak_threshold) {
+    const auto image_saturation_stats{image.statistics().channel(Magick::PixelChannel::GreenPixelChannel)};
+    const auto mean_saturation{quantum_to_percent(image_saturation_stats.mean())};
+    const auto maxima_saturation{quantum_to_percent(image_saturation_stats.maxima())};
+
+    logger(hyx::logger_literals::debug, "Saturation mean: {}%\n", mean_saturation);
+    logger(hyx::logger_literals::debug, "Saturation maxima: {}%\n", maxima_saturation);
+
+    constexpr auto mean_threashold{5.0};
+    constexpr auto maxima_threashold{10.0};
+    // if we have small mean saturation and no large spike (maxima) of saturation anywhere, image is grayscale
+    if (mean_saturation < mean_threashold && maxima_saturation < maxima_threashold) {
         return true;
     }
 
+    // if we have high mean, image is not grayscale
+    // if we have high maxima, image contains some significant color (e.g., logo)
     return false;
 }
 
-bool is_bw(Magick::Image& image)
+bool is_bw(Magick::Image image)
 {
     // constinit static const auto log_prefix{"BW Check"};
 
     // magick in.png -solarize 50% -colorspace gray -identify -verbose info:
 
-    Magick::Image bw_image_test{image};
-    bw_image_test.solarize(50_quantum_percent);
-    bw_image_test.colorSpace(Magick::GRAYColorspace);
-    auto image_stats{bw_image_test.statistics().channel(Magick::PixelChannel::GrayPixelChannel)};
+    image.solarize(50_quantum_percent);
+    image.colorSpace(Magick::GRAYColorspace);
 
-    auto mean_gray{quantum_as_rgb(image_stats.mean())};
-    auto std_diff_mean_gray{std::abs(quantum_as_rgb(image_stats.standardDeviation() - image_stats.mean()))};
+    auto image_gray_stats{image.statistics().channel(Magick::PixelChannel::GrayPixelChannel)};
+    auto mean_gray{quantum_to_percent(image_gray_stats.mean())};
+    auto stddev_gray{quantum_to_percent(image_gray_stats.standardDeviation())};
 
     logger(hyx::logger_literals::debug, "Gray mean: {}\n", mean_gray);
-    logger(hyx::logger_literals::debug, "Gray std-dev-mean-diff: {}\n", std_diff_mean_gray);
+    logger(hyx::logger_literals::debug, "Gray standard deviation: {}\n", stddev_gray);
 
-    constexpr auto rgb_max{255};
-    constexpr auto mean_gray_rgb_threshold{rgb_max / 6};
-    constexpr auto std_diff_mean_gray_threshold{15.5};
-    if (mean_gray < mean_gray_rgb_threshold && std_diff_mean_gray < std_diff_mean_gray_threshold) {
+    constexpr auto mean_threshold{5.0};
+    constexpr auto stddev_threshold{10.0};
+    // if we have close to zero mean and small, but larger than mean, deviation, image is bw
+    if (mean_gray < mean_threshold && stddev_gray < stddev_threshold && stddev_gray > mean_gray) {
         return true;
     }
 
+    // if we have any other case, image is not bw
     return false;
 }
 
-bool is_spot_colored(Magick::Image& image)
-{
-    // constinit static const auto log_prefix{"Spot Color Check"};
-
-    Magick::Image spot_image_test{image};
-    spot_image_test.colorSpace(Magick::HCLColorspace);
-    spot_image_test.resize("1:50");
-    auto gray_factor{std::stod(spot_image_test.formatExpression("%[fx:mean.g]"))};
-    auto gray_peak{std::stod(spot_image_test.formatExpression("%[fx:maxima.g]"))};
-
-    logger(hyx::logger_literals::debug, "Color mean: {}\n", gray_factor);
-    logger(hyx::logger_literals::debug, "Color peak: {}\n", gray_peak);
-
-    constexpr auto gray_factor_threshold{0.05};
-    constexpr auto gray_peak_min{0.3};
-    if (gray_factor < gray_factor_threshold && gray_peak > gray_peak_min) {
-        return true;
-    }
-
-    return false;
-}
-
-bool is_white(Magick::Image& image)
+bool is_white(Magick::Image image)
 {
     // constinit static const auto log_prefix{"All White Check"};
 
-    Magick::Image percent_white_image{image};
-    percent_white_image.whiteThreshold("75%");
-    auto percent_white = std::stod(percent_white_image.formatExpression("%[fx:mean]"));
+    image.whiteThreshold("75%");
+    const auto percent_white{std::stod(image.formatExpression("%[fx:mean]"))};
 
     logger(hyx::logger_literals::debug, "Percent white: {}\n", percent_white);
 
@@ -709,6 +699,7 @@ int main(int argc, char** argv)
                         else if (is_grayscale(image)) {
                             transform_to_grayscale(image);
                         }
+                        // else, image is color
 
                         dump_image(image, "reduced");
 
