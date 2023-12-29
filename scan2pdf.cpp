@@ -453,10 +453,12 @@ bool is_bw(Magick::Image image)
     logger(hyx::logger_literals::debug, "Gray mean: {}\n", mean_gray);
     logger(hyx::logger_literals::debug, "Gray standard deviation: {}\n", stddev_gray);
 
-    constexpr auto mean_threshold{5.0};
-    constexpr auto stddev_threshold{10.0};
+    constexpr auto mean_threshold{12.0};
+    constexpr auto stddev_threshold{18.0};
+    constexpr auto stddev_mean_diff_threashold{-0.6};
     // if we have close to zero mean and small, but larger than mean, deviation, image is bw
-    if (mean_gray < mean_threshold && stddev_gray < stddev_threshold && stddev_gray > mean_gray) {
+    // (we will allow a small padding for close deviation and mean difference to prefer bw over other options when it's unclear)
+    if (mean_gray < mean_threshold && stddev_gray < stddev_threshold && (stddev_gray - mean_gray) > stddev_mean_diff_threashold) {
         return true;
     }
 
@@ -669,30 +671,12 @@ int main(int argc, char** argv)
 
                     dump_image(image, "proccessed");
 
-                    // ask user if almost white images should be deleted.
-                    //! FIXME: using a lambda for now
-                    auto ask_user_should_keep_image = [&image, &img_num]() -> bool {
-                        if (is_white(image)) {
-                            logger(hyx::logger_literals::warning, "May be blank\n");
+                    if (is_white(image)) {
+                        logger("Removing image\n");
+                    }
+                    else {
+                        logger("Keeping image\n");
 
-                            std::string user_answer;
-                            std::cout << "Possible blank page found (pg. " << img_num << "). Keep the page? [Y/n] ";
-                            std::getline(std::cin, user_answer);
-
-                            if (!user_answer.empty() && (user_answer.front() == 'N' || user_answer.front() == 'n')) {
-                                logger("Removing image\n");
-                                return false;
-                            }
-                            else {
-                                logger("Keeping image\n");
-                                // fall through
-                            }
-                        }
-
-                        return true;
-                    };
-
-                    if (ask_user_should_keep_image()) {
                         if (is_bw(image)) {
                             has_text(tess_api.get(), hyx::unique_pix(magick2pix(image)).get()) ? transform_with_text_to_bw(image) : transform_to_bw(image);
                         }
