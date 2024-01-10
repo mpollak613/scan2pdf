@@ -80,6 +80,7 @@ void set_device_options(hyx::sane_device* device);
 
 void proccess(Magick::Image& image);
 std::string get_trim_shadow_bounds(Magick::Image image);
+double get_deskew_angle(Magick::Image image);
 void deskew(Magick::Image& image);
 std::string get_trim_edges_bounds(Magick::Image image);
 
@@ -249,26 +250,32 @@ void proccess(Magick::Image& image)
     image.gamma(global::scanner_gamma_fix);
 }
 
+double get_deskew_angle(Magick::Image image)
+{
+    logger(hyx::logger_literals::debug, "Getting deskew angle\n");
+
+    // reducing the image size will greatly improve deskew time and accuracy due to less pixels and 'fuzzing'
+    image.resize("10%");
+    image.autoThreshold(Magick::OTSUThresholdMethod);
+    image.deskew(80_quantum_percent);
+
+    // note: negative since the image got flipped
+    return std::stod(image.artifact("deskew:angle"));
+}
+
 void deskew(Magick::Image& image)
 {
     logger("Deskewing image\n");
 
-    // we flip the image to get the shadow on the top before deskewing
-    image.flip();
-
     // Find the color of the scan background.
     const auto background_color{image.pixelColor(5, 5)};
+    image.backgroundColor(background_color);
     logger(hyx::logger_literals::debug, "Set background color to ({},{},{})\n", quantum_as_rgb(background_color.quantumRed()), quantum_as_rgb(background_color.quantumGreen()), quantum_as_rgb(background_color.quantumBlue()));
 
-    image.backgroundColor(background_color);
-    image.deskew(80_quantum_percent);
 
-    const auto deskew_angle{image.formatExpression("%[deskew:angle]")};
+    const auto deskew_angle{get_deskew_angle(image)};
+    image.rotate(deskew_angle);
     logger(hyx::logger_literals::debug, "Deskewed by {} degrees\n", deskew_angle);
-
-    // reset image state besides deskewing
-    image.flip();
-    image.backgroundColor();
 
     dump_image(image, "deskewed");
 }
@@ -740,7 +747,7 @@ int main(int argc, char** argv)
     }
     catch (const std::exception& e) {
         std::cout << e.what() << "\n";
-        logger(hyx::logger_literals::error, "{}\n", e.what());
+        logger(hyx::logger_literals::fatal, "{}\n", e.what());
         return 1;
     }
     // catch (const Magick::Error& me) {
