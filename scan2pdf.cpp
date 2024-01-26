@@ -1,9 +1,18 @@
-/**
- * @file scan2pdf.cpp
- * @copyright
- * Copyright 2022-2023 Michael Pollak.
- * All rights reserved.
- */
+// <scan2pdf.cpp> -*- C++ -*-
+// Copyright (C) 2022-2024 Michael Pollak
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // Python defines many things that need to come before other imports
 #include <Python.h> // non-standard
@@ -33,6 +42,7 @@
 #include <regex>
 #include <sane/sane.h>     // non-standard
 #include <sane/saneopts.h> // non-standard
+#include <stdexcept>
 #include <string>
 #include <tesseract/baseapi.h>  // non-standard
 #include <tesseract/renderer.h> // non-standard
@@ -47,7 +57,7 @@
 #endif                // !HAVE_LIBTIFF
 
 namespace global {
-    constexpr std::string_view version{"2.4"};
+    constexpr std::string_view version{"2.4.1"};
     constexpr auto scanner_gamma_fix{2.2};
 } // namespace global
 
@@ -79,10 +89,10 @@ void print_version();
 void set_device_options(hyx::sane_device* device);
 
 void proccess(Magick::Image& image);
-std::string get_trim_shadow_bounds(Magick::Image image);
+Magick::Geometry get_trim_shadow_bounds(Magick::Image image);
 double get_deskew_angle(Magick::Image image);
 void deskew(Magick::Image& image);
-std::string get_trim_edges_bounds(Magick::Image image);
+Magick::Geometry get_trim_edges_bounds(Magick::Image image);
 
 void transform_to_bw(Magick::Image& image);
 void transform_with_text_to_bw(Magick::Image& image);
@@ -105,12 +115,12 @@ static std::unordered_map<std::string, std::any> sane_options{
     {SANE_NAME_SCAN_RESOLUTION, 300},
     {SANE_NAME_PAGE_HEIGHT, std::numeric_limits<SANE_Word>::max()},
     {SANE_NAME_PAGE_WIDTH, std::numeric_limits<SANE_Word>::max()},
-    {"ald", true}};
+    {"ald", false}};
 
 constexpr void dump_image([[maybe_unused]] Magick::Image& img, [[maybe_unused]] const std::string& name)
 {
 #ifdef DEBUG
-    static int idx{};
+    constinit static int idx{};
 
     img.write(hyx::home_path() / "Downloads/tmp" / ("debugged_image_" + std::to_string(idx) + name + ".png"));
     ++idx;
@@ -202,10 +212,7 @@ void print_help()
 void print_version()
 {
     std::cout << "scan2pdf " << global::version << '\n';
-    std::cout << "Copyright (C) 2022-2023 Michael Pollak\n";
-    std::cout << "License Apache-2.0: Apache License, Version 2.0 <https://www.apache.org/licenses/LICENSE-2.0>\n";
-    std::cout << '\n';
-    std::cout << "Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.\n";
+    std::cout << "Copyright (C) 2022-2024 Michael Pollak\n";
 }
 
 void set_device_options(hyx::sane_device* device)
@@ -231,16 +238,19 @@ void set_device_options(hyx::sane_device* device)
 
 void proccess(Magick::Image& image)
 {
-    // basic image changes
+    // we need to despeckle before any trims so small artifacts won't mess with them
     image.despeckle();
-    image.enhance();
     image.alpha(false);
-
-    deskew(image);
-    image.repage();
 
     // crop the scan edges of the image
     image.crop(get_trim_edges_bounds(image));
+    image.repage();
+
+    dump_image(image, "cropped");
+
+    image.enhance();
+
+    deskew(image);
     image.repage();
 
     // remove the shadow on the top of the image
@@ -259,7 +269,6 @@ double get_deskew_angle(Magick::Image image)
     image.autoThreshold(Magick::OTSUThresholdMethod);
     image.deskew(80_quantum_percent);
 
-    // note: negative since the image got flipped
     return std::stod(image.artifact("deskew:angle"));
 }
 
@@ -272,7 +281,6 @@ void deskew(Magick::Image& image)
     image.backgroundColor(background_color);
     logger(hyx::logger_literals::debug, "Set background color to ({},{},{})\n", quantum_as_rgb(background_color.quantumRed()), quantum_as_rgb(background_color.quantumGreen()), quantum_as_rgb(background_color.quantumBlue()));
 
-
     const auto deskew_angle{get_deskew_angle(image)};
     image.rotate(deskew_angle);
     logger(hyx::logger_literals::debug, "Deskewed by {} degrees\n", deskew_angle);
@@ -280,42 +288,22 @@ void deskew(Magick::Image& image)
     dump_image(image, "deskewed");
 }
 
-std::string get_trim_edges_bounds(Magick::Image image)
+Magick::Geometry get_trim_edges_bounds(Magick::Image image)
 {
-    // magick in.png -fuzz 10% -set MBB '%[minimum-bounding-box]' -fill black -colorize 100 -fill white -draw "polygon %[MBB]" -define trim:percent-background=0 -trim -format "%wx%h%X%Y" info:
+    // magick in.png -fuzz 10% -format "%[minimum-bounding-box]" info:
 
     logger("Trimming edges\n");
 
-    // the colorFuzz value will influence the MBR
+    // the colorFuzz value will influence the Minimum Bounding Rectangle
     image.colorFuzz(10_quantum_percent);
-    // MBR = Minimum Bounding Rectangle
-    auto mbr{image.formatExpression("%[minimum-bounding-box]")};
 
-    // create our polygon coordinates
-    std::vector<Magick::Coordinate> mbr_coords;
-    for (const auto& coord : mbr | std::views::split(' ')) {
-        for (const auto& [x, y] : coord | std::views::split(',') | std::views::pairwise) {
-            mbr_coords.emplace_back(std::stod(std::string(x.begin(), x.end())), std::stod(std::string(y.begin(), y.end())));
-        }
-    }
+    const auto bb{image.boundingBox()};
+    logger(hyx::logger_literals::debug, "Image bounding Box: {}x{}{:+}{:+}\n", bb.width(), bb.height(), bb.xOff(), bb.yOff());
 
-    // create a black background and white box over the MBR so we can easily trim to it.
-    constexpr auto colorize_alpha{100u};
-    image.colorize(colorize_alpha, "black");
-    image.fillColor("white");
-    image.draw(Magick::DrawablePolygon(mbr_coords));
-    image.artifact("trim:percent-background", "0");
-
-    dump_image(image, "trim_edges_before_trim");
-
-    image.trim();
-
-    dump_image(image, "trim_edges");
-
-    return image.formatExpression("%wx%h%X%Y");
+    return bb;
 }
 
-std::string get_trim_shadow_bounds(Magick::Image image)
+Magick::Geometry get_trim_shadow_bounds(Magick::Image image)
 {
     logger("Trimming shadow\n");
 
@@ -326,38 +314,42 @@ std::string get_trim_shadow_bounds(Magick::Image image)
     image.negate();
     image.autoThreshold(Magick::OTSUThresholdMethod);
     image.negate();
-    image.artifact("trim:percent-background", "5");
+    image.artifact("trim:percent-background", "2");
     image.artifact("trim:background-color", "black");
 
     dump_image(image, "trim_shadow_before_trim");
 
-    auto image_canvas{image.formatExpression("%wx%h%X%Y")};
-    logger(hyx::logger_literals::debug, "Starting dimentions: {}\n", image_canvas);
+    auto image_canvas{image.size()};
+    logger(hyx::logger_literals::debug, "Starting dimentions: {}x{}{:+}{:+}\n", image_canvas.width(), image_canvas.height(), image_canvas.xOff(), image_canvas.yOff());
     try {
         for ([[maybe_unused]] auto _ : std::views::iota(0, 10)) {
-            const auto before_trim_image_canvas = image.formatExpression("%wx%h%X%Y");
+            const auto before_trim_image_canvas = image.size();
             image.trim();
-            const auto after_trim_image_canvas = image.formatExpression("%wx%h%X%Y");
+            const auto after_trim_image_canvas = image.size();
+            logger(hyx::logger_literals::debug, "After trim dimentions: {}x{}{:+}{:+}\n", after_trim_image_canvas.width(), after_trim_image_canvas.height(), after_trim_image_canvas.xOff(), after_trim_image_canvas.yOff());
 
-            // check to see if the trim removed anything
-            logger(hyx::logger_literals::debug, "After trim dimentions: {}\n", after_trim_image_canvas);
-            if (before_trim_image_canvas == after_trim_image_canvas) {
-                // maybe the shadow is not at the edge of the image?
-                // we will try to dig one pixel at a time to find the shadow
-                logger(hyx::logger_literals::debug, "Removing pixel line to find shadow\n");
-                image.crop("+0-1");
-                image.repage();
+            constexpr auto min_image_dims{500};
+            if (image.size().height() < min_image_dims || image.size().width() < min_image_dims) {
+                throw std::runtime_error("image is too small after trim");
             }
-            else {
-                image_canvas = after_trim_image_canvas;
+            else if (before_trim_image_canvas != after_trim_image_canvas) {
+                // ok, we removed the shadow
                 break;
             }
+            // else
+
+            // maybe the shadow is not at the edge of the image?
+            // we will try to dig one pixel at a time to find the shadow
+            logger(hyx::logger_literals::debug, "Removing pixel line to find shadow\n");
+            image.crop({0,0,0,-1});
+            image.repage();
         }
     }
     catch (const std::exception& e) {
         logger(hyx::logger_literals::warning, "Failed to trim shadow: {}\n", e.what());
     }
 
+    image.size(image_canvas);
     dump_image(image, "trim_shadow_after_trim");
 
     return image_canvas;
@@ -482,7 +474,7 @@ bool is_white(Magick::Image image)
 
     logger(hyx::logger_literals::debug, "Percent white: {}\n", percent_white);
 
-    constexpr auto percent_white_threshold{0.99};
+    constexpr auto percent_white_threshold{0.9999};
     if (percent_white > percent_white_threshold) {
         return true;
     }
