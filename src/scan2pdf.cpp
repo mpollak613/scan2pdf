@@ -8,11 +8,11 @@
 
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 // Python defines many things that need to come before other imports
 #include <Python.h> // non-standard
@@ -47,9 +47,15 @@
 #include <unordered_map>
 #include <vector>
 
-#include "leptonica.h" // non-standard
-#include "python.h"    // non-standard
-#include "sane.h"      // non-standard
+#include "debug.h"
+#include "image_details.h"
+#include "image_transformations.h"
+#include "image_type.h"
+#include "leptonica.h"
+#include "ocr_parsing.h"
+#include "python.h"
+#include "sane.h"
+#include "units.h"
 
 //! TODO: allow for other image formats if libtiff is not available
 #ifdef HAVE_LIBTIFF
@@ -59,52 +65,9 @@
 
 namespace global {
     constexpr std::string_view version{"2.4.2"};
-    constexpr auto scanner_gamma_fix{2.2};
 } // namespace global
 
 hyx::logger logger(std::clog, "[cl::utc;%FT%TZ][[[::lvl;^9]]]: [sl::file_name;]@[sl::line;]: ");
-
-//! FIXME: QuantumRange Seems broken? MaxMap works for now.
-
-constexpr double percent_to_quantum(std::convertible_to<double> auto percent);
-constexpr double quantum_to_percent(std::convertible_to<double> auto quantum);
-constexpr long double quantum_as_rgb(long double quantum_val);
-
-consteval double operator""_quantum_percent(long double percent)
-{
-    return percent_to_quantum(percent);
-}
-consteval double operator"" _quantum_percent(unsigned long long percent)
-{
-    return percent_to_quantum(percent);
-}
-
-std::string get_current_date();
-std::string parse_organization(const std::string& text, const std::string& default_return);
-
-Magick::Image get_next_image(hyx::sane_device* device);
-
-void print_help();
-void print_version();
-
-void set_device_options(hyx::sane_device* device);
-
-void proccess(Magick::Image& image);
-Magick::Geometry get_trim_shadow_bounds(Magick::Image image);
-double get_deskew_angle(Magick::Image image);
-void deskew(Magick::Image& image);
-Magick::Geometry get_trim_edges_bounds(Magick::Image image);
-
-void transform_to_bw(Magick::Image& image);
-void transform_with_text_to_bw(Magick::Image& image);
-void transform_to_grayscale(Magick::Image& image);
-int get_orientation(tesseract::TessBaseAPI* tess_api, PIX* pimage);
-bool is_grayscale(Magick::Image image);
-bool is_bw(Magick::Image image);
-bool is_white(Magick::Image image);
-bool has_text(PIX* pimage, tesseract::TessBaseAPI* tess_api);
-PIX* magick2pix(Magick::Image& image);
-std::string get_text(tesseract::TessBaseAPI* tess_api, PIX* pimage);
 
 /**
  * @brief Global options.
@@ -117,49 +80,6 @@ static std::unordered_map<std::string, std::any> sane_options{
     {SANE_NAME_PAGE_HEIGHT, std::numeric_limits<SANE_Word>::max()},
     {SANE_NAME_PAGE_WIDTH, std::numeric_limits<SANE_Word>::max()},
     {"ald", false}};
-
-constexpr void dump_image([[maybe_unused]] Magick::Image& img, [[maybe_unused]] const std::string& name)
-{
-#ifdef DEBUG
-    constinit static int idx{};
-
-    img.write(hyx::home_path() / "Downloads/tmp" / ("debugged_image_" + std::to_string(idx) + name + ".png"));
-    ++idx;
-#endif
-}
-
-constexpr long double quantum_as_rgb(long double quantum_val)
-{
-    constexpr auto rgb_max{255.0L};
-    return (quantum_val / MaxMap) * rgb_max;
-}
-
-constexpr double percent_to_quantum(std::convertible_to<double> auto percent)
-{
-    constexpr auto percent_max{100.0};
-    return (static_cast<double>(percent) / percent_max) * MaxMap;
-}
-
-constexpr double quantum_to_percent(std::convertible_to<double> auto quantum)
-{
-    constexpr auto percent_max{100.0};
-    return (static_cast<double>(quantum) / MaxMap) * percent_max;
-}
-
-std::string get_current_date()
-{
-    return std::format("{:%Y-%m-%d}", std::chrono::system_clock::now());
-}
-
-std::string parse_organization(const std::string& text, const std::string& default_return)
-{
-    if (std::string org{hyx::py_init::get_instance().import("guess_organization")->call("guess_organization", text)}; !org.empty()) [[likely]] {
-        return org;
-    }
-    else [[unlikely]] {
-        return default_return;
-    }
-}
 
 Magick::Image get_next_image(hyx::sane_device* device)
 {
@@ -244,282 +164,22 @@ void proccess(Magick::Image& image)
     image.alpha(false);
 
     // crop the scan edges of the image
-    image.crop(get_trim_edges_bounds(image));
+    image.crop(get_trim_edges_bounds(logger, image));
     image.repage();
 
     dump_image(image, "cropped");
 
     image.enhance();
 
-    deskew(image);
+    deskew(logger, image);
     image.repage();
 
     // remove the shadow on the top of the image
-    image.crop(get_trim_shadow_bounds(image));
+    image.crop(get_trim_shadow_bounds(logger, image));
     image.repage();
 
-    image.gamma(global::scanner_gamma_fix);
-}
-
-double get_deskew_angle(Magick::Image image)
-{
-    logger(hyx::logger_literals::debug, "Getting deskew angle\n");
-
-    // reducing the image size will greatly improve deskew time and accuracy due to less pixels and 'fuzzing'
-    image.resize("10%");
-    image.autoThreshold(Magick::OTSUThresholdMethod);
-    image.deskew(80_quantum_percent);
-
-    return std::stod(image.artifact("deskew:angle"));
-}
-
-void deskew(Magick::Image& image)
-{
-    logger("Deskewing image\n");
-
-    // TODO: replace 'true' with has_text for the image
-    if (true) {
-        auto angle{0.0};
-        auto angle_delta{1.0};
-
-        const auto count_white_lines{[](Magick::Image image, const auto ang) {
-            image.rotate(ang);
-            image.negate();
-            image.autoThreshold(Magick::OTSUThresholdMethod);
-            image.negate();
-            image.scale("1x!");
-        }};
-    }
-    else {
-        // use code below
-    }
-
-    // Find the color of the scan background.
-    const auto background_color{image.pixelColor(5, 5)};
-    image.backgroundColor(background_color);
-    logger(hyx::logger_literals::debug, "Set background color to ({},{},{})\n", quantum_as_rgb(background_color.quantumRed()), quantum_as_rgb(background_color.quantumGreen()), quantum_as_rgb(background_color.quantumBlue()));
-
-    const auto deskew_angle{get_deskew_angle(image)};
-    image.rotate(deskew_angle);
-    logger(hyx::logger_literals::debug, "Deskewed by {} degrees\n", deskew_angle);
-
-    dump_image(image, "deskewed");
-}
-
-Magick::Geometry get_trim_edges_bounds(Magick::Image image)
-{
-    // magick in.png -fuzz 10% -format "%[minimum-bounding-box]\n" info:
-
-    logger("Trimming edges\n");
-
-    // the colorFuzz value will influence the Minimum Bounding Rectangle
-    image.colorFuzz(10_quantum_percent);
-
-    const auto bb{image.boundingBox()};
-    logger(hyx::logger_literals::debug, "Image bounding Box: {}x{}{:+}{:+}\n", bb.width(), bb.height(), bb.xOff(), bb.yOff());
-
-    return bb;
-}
-
-Magick::Geometry get_trim_shadow_bounds(Magick::Image image)
-{
-    logger("Trimming shadow\n");
-
-    image.gamma(global::scanner_gamma_fix);
-    constexpr auto blur_radius{0.0};
-    constexpr auto blur_sigma{5.0};
-    image.adaptiveBlur(blur_radius, blur_sigma);
-    image.negate();
-    image.autoThreshold(Magick::OTSUThresholdMethod);
-    image.negate();
-    image.artifact("trim:percent-background", "2");
-    image.artifact("trim:background-color", "black");
-
-    dump_image(image, "trim_shadow_before_trim");
-
-    auto image_canvas{image.size()};
-    logger(hyx::logger_literals::debug, "Starting dimentions: {}x{}{:+}{:+}\n", image_canvas.width(), image_canvas.height(), image_canvas.xOff(), image_canvas.yOff());
-    try {
-        for ([[maybe_unused]] auto _ : std::views::iota(0, 10)) {
-            const auto before_trim_image_canvas = image.size();
-            image.trim();
-            const auto after_trim_image_canvas = image.size();
-            logger(hyx::logger_literals::debug, "After trim dimentions: {}x{}{:+}{:+}\n", after_trim_image_canvas.width(), after_trim_image_canvas.height(), after_trim_image_canvas.xOff(), after_trim_image_canvas.yOff());
-
-            constexpr auto min_image_dims{500};
-            if (image.size().height() < min_image_dims || image.size().width() < min_image_dims) {
-                throw std::runtime_error("image is too small after trim");
-            }
-            else if (before_trim_image_canvas != after_trim_image_canvas) {
-                // ok, we removed the shadow
-                break;
-            }
-            // else
-
-            // maybe the shadow is not at the edge of the image?
-            // we will try to dig one pixel at a time to find the shadow
-            logger(hyx::logger_literals::debug, "Removing pixel line to find shadow\n");
-            image.crop({0, 0, 0, -1});
-            image.repage();
-        }
-    }
-    catch (const std::exception& e) {
-        logger(hyx::logger_literals::warning, "Failed to trim shadow: {}\n", e.what());
-    }
-
-    image.size(image_canvas);
-    dump_image(image, "trim_shadow_after_trim");
-
-    return image_canvas;
-}
-
-void transform_to_bw(Magick::Image& image)
-{
-    logger(hyx::logger_literals::debug, "Converting to black and white\n");
-
-    constexpr auto brightness{0.0};
-    constexpr auto constrast{30.0};
-    image.brightnessContrast(brightness, constrast);
-    image.autoThreshold(Magick::KapurThresholdMethod);
-}
-
-void transform_with_text_to_bw(Magick::Image& image)
-{
-    logger(hyx::logger_literals::debug, "Converting to black and white\n");
-
-    // magick in.png -auto-level -unsharp 0x2+1.5+0.05 -resize 200% -auto-threshold otsu out.pdf
-    // TODO: use -colorspace gray -auto-level -negate -lat 30x30+10% -negate
-
-    image.autoLevel();
-    constexpr auto unsharp_radius{0.0};
-    constexpr auto unsharp_sigma{2.0};
-    constexpr auto unsharp_amount{1.5};
-    constexpr auto unsharp_threshold{0.05};
-    image.unsharpmask(unsharp_radius, unsharp_sigma, unsharp_amount, unsharp_threshold);
-    image.autoThreshold(Magick::OTSUThresholdMethod);
-}
-
-void transform_to_grayscale(Magick::Image& image)
-{
-    logger(hyx::logger_literals::debug, "Converting to greyscale\n");
-
-    constexpr auto brightness{0.0};
-    constexpr auto contrast{30.0};
-    image.brightnessContrast(brightness, contrast);
-    image.opaque(Magick::Color("white"), Magick::Color("white"));
-    image.colorSpace(Magick::LinearGRAYColorspace);
-}
-
-int get_orientation(tesseract::TessBaseAPI* tess_api, PIX* pimage)
-{
-    logger("Getting orientation\n");
-    tess_api->SetImage(pimage);
-
-    // default to not changing the orientation
-    int ori_deg{0};
-    //// float ori_conf;
-    //// const char* script_name;
-    //// float script_conf;
-    tess_api->DetectOrientationScript(&ori_deg, nullptr, nullptr, nullptr);
-
-    logger(hyx::logger_literals::debug, "Orientation off by {} degrees\n", ori_deg);
-
-    return ori_deg;
-}
-
-bool is_grayscale(Magick::Image image)
-{
-    // constinit static const auto log_prefix{"Grayscale Check"};
-
-    // magick in.png -colorspace HSB -resize 2% -format "%[fx:mean.g] %[fx:maxima.g]\n" info:-
-
-    image.colorSpace(Magick::HSBColorspace);
-    image.resize("2%");
-
-    const auto image_saturation_stats{image.statistics().channel(Magick::PixelChannel::GreenPixelChannel)};
-    const auto mean_saturation{quantum_to_percent(image_saturation_stats.mean())};
-    const auto maxima_saturation{quantum_to_percent(image_saturation_stats.maxima())};
-
-    logger(hyx::logger_literals::debug, "Saturation mean: {}%\n", mean_saturation);
-    logger(hyx::logger_literals::debug, "Saturation maxima: {}%\n", maxima_saturation);
-
-    constexpr auto mean_threashold{5.0};
-    constexpr auto maxima_threashold{10.0};
-    // if we have small mean saturation and no large spike (maxima) of saturation anywhere, image is grayscale
-    if (mean_saturation < mean_threashold && maxima_saturation < maxima_threashold) {
-        return true;
-    }
-
-    // if we have high mean, image is not grayscale
-    // if we have high maxima, image contains some significant color (e.g., logo)
-    return false;
-}
-
-bool is_bw(Magick::Image image)
-{
-    // constinit static const auto log_prefix{"BW Check"};
-
-    // magick in.png -solarize 50% -colorspace gray -identify -verbose info:
-
-    image.solarize(50_quantum_percent);
-    image.colorSpace(Magick::GRAYColorspace);
-
-    auto image_gray_stats{image.statistics().channel(Magick::PixelChannel::GrayPixelChannel)};
-    auto mean_gray{quantum_to_percent(image_gray_stats.mean())};
-    auto stddev_gray{quantum_to_percent(image_gray_stats.standardDeviation())};
-
-    logger(hyx::logger_literals::debug, "Gray mean: {}\n", mean_gray);
-    logger(hyx::logger_literals::debug, "Gray standard deviation: {}\n", stddev_gray);
-
-    constexpr auto mean_threshold{12.0};
-    constexpr auto stddev_threshold{18.0};
-    constexpr auto stddev_mean_diff_threashold{-0.6};
-    // if we have close to zero mean and small, but larger than mean, deviation, image is bw
-    // (we will allow a small padding for close deviation and mean difference to prefer bw over other options when it's unclear)
-    if (mean_gray < mean_threshold && stddev_gray < stddev_threshold && (stddev_gray - mean_gray) > stddev_mean_diff_threashold) {
-        return true;
-    }
-
-    // if we have any other case, image is not bw
-    return false;
-}
-
-bool is_white(Magick::Image image)
-{
-    // constinit static const auto log_prefix{"All White Check"};
-
-    image.whiteThreshold("75%");
-    const auto percent_white{std::stod(image.formatExpression("%[fx:mean]"))};
-
-    logger(hyx::logger_literals::debug, "Percent white: {}\n", percent_white);
-
-    constexpr auto percent_white_threshold{0.9999};
-    if (percent_white > percent_white_threshold) {
-        return true;
-    }
-
-    return false;
-}
-
-bool has_text(PIX* pimage, tesseract::TessBaseAPI* tess_api)
-{
-    tess_api->SetImage(pimage);
-    std::unique_ptr<char> image_text{tess_api->GetUTF8Text()};
-    return !std::string_view(image_text.get()).empty();
-}
-
-PIX* magick2pix(Magick::Image& image)
-{
-    Magick::Blob bimage;
-    image.write(&bimage, "tiff");
-    return pixReadMemTiff(static_cast<const unsigned char*>(bimage.data()), bimage.length(), 0);
-}
-
-std::string get_text(tesseract::TessBaseAPI* tess_api, PIX* pimage)
-{
-    tess_api->SetImage(pimage);
-    auto ocr_text{std::unique_ptr<char[]>(tess_api->GetUTF8Text())};
-    return (ocr_text) ? ocr_text.get() : "";
+    constexpr auto gamma_fix{2.2};
+    image.gamma(gamma_fix);
 }
 
 int main(int argc, char** argv)
@@ -689,17 +349,17 @@ int main(int argc, char** argv)
 
                     dump_image(image, "proccessed");
 
-                    if (is_white(image)) {
+                    if (is_white(logger, image)) {
                         logger("Removing image\n");
                     }
                     else {
                         logger("Keeping image\n");
 
-                        if (is_bw(image)) {
-                            has_text(hyx::unique_pix(magick2pix(image)).get(), tess_api.get()) ? transform_with_text_to_bw(image) : transform_to_bw(image);
+                        if (is_bw(logger, image)) {
+                            has_text(hyx::unique_pix(magick2pix(image)).get(), tess_api.get()) ? transform_with_text_to_bw(logger, image) : transform_to_bw(logger, image);
                         }
-                        else if (is_grayscale(image)) {
-                            transform_to_grayscale(image);
+                        else if (is_grayscale(logger, image)) {
+                            transform_to_grayscale(logger, image);
                         }
                         // else, image is color
 
@@ -708,7 +368,7 @@ int main(int argc, char** argv)
                         hyx::unique_pix pimage{magick2pix(image)};
 
                         // attempt to orient using tesseract.
-                        auto ori_deg{get_orientation(tess_api.get(), pimage.get())};
+                        auto ori_deg{get_orientation(logger, tess_api.get(), pimage.get())};
 
                         logger(hyx::logger_literals::debug, "Rotating by {} degrees\n", ori_deg);
                         image.rotate(360 - ori_deg);
