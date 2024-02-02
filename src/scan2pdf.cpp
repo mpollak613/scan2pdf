@@ -28,11 +28,8 @@
 #include <filesystem>
 #include <hyx/circular_buffer.h> // non-standard
 #include <hyx/filesystem.h>      // non-standard
-#include <hyx/leptonica.h>       // non-standard
 #include <hyx/logger.h>          // non-standard
 #include <hyx/parser.h>          // non-standard
-#include <hyx/python.h>          // non-standard
-#include <hyx/sane.h>            // non-standard
 #include <iostream>
 #include <leptonica/allheaders.h> // non-standard
 #include <limits>
@@ -50,6 +47,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "leptonica.h" // non-standard
+#include "python.h"    // non-standard
+#include "sane.h"      // non-standard
+
 //! TODO: allow for other image formats if libtiff is not available
 #ifdef HAVE_LIBTIFF
 #include <tiffio.h>   // non-standard
@@ -57,7 +58,7 @@
 #endif                // !HAVE_LIBTIFF
 
 namespace global {
-    constexpr std::string_view version{"2.4.1"};
+    constexpr std::string_view version{"2.4.2"};
     constexpr auto scanner_gamma_fix{2.2};
 } // namespace global
 
@@ -101,7 +102,7 @@ int get_orientation(tesseract::TessBaseAPI* tess_api, PIX* pimage);
 bool is_grayscale(Magick::Image image);
 bool is_bw(Magick::Image image);
 bool is_white(Magick::Image image);
-bool has_text(tesseract::TessBaseAPI* tess_api, PIX* pimage);
+bool has_text(PIX* pimage, tesseract::TessBaseAPI* tess_api);
 PIX* magick2pix(Magick::Image& image);
 std::string get_text(tesseract::TessBaseAPI* tess_api, PIX* pimage);
 
@@ -276,6 +277,23 @@ void deskew(Magick::Image& image)
 {
     logger("Deskewing image\n");
 
+    // TODO: replace 'true' with has_text for the image
+    if (true) {
+        auto angle{0.0};
+        auto angle_delta{1.0};
+
+        const auto count_white_lines{[](Magick::Image image, const auto ang) {
+            image.rotate(ang);
+            image.negate();
+            image.autoThreshold(Magick::OTSUThresholdMethod);
+            image.negate();
+            image.scale("1x!");
+        }};
+    }
+    else {
+        // use code below
+    }
+
     // Find the color of the scan background.
     const auto background_color{image.pixelColor(5, 5)};
     image.backgroundColor(background_color);
@@ -290,7 +308,7 @@ void deskew(Magick::Image& image)
 
 Magick::Geometry get_trim_edges_bounds(Magick::Image image)
 {
-    // magick in.png -fuzz 10% -format "%[minimum-bounding-box]" info:
+    // magick in.png -fuzz 10% -format "%[minimum-bounding-box]\n" info:
 
     logger("Trimming edges\n");
 
@@ -341,7 +359,7 @@ Magick::Geometry get_trim_shadow_bounds(Magick::Image image)
             // maybe the shadow is not at the edge of the image?
             // we will try to dig one pixel at a time to find the shadow
             logger(hyx::logger_literals::debug, "Removing pixel line to find shadow\n");
-            image.crop({0,0,0,-1});
+            image.crop({0, 0, 0, -1});
             image.repage();
         }
     }
@@ -370,6 +388,7 @@ void transform_with_text_to_bw(Magick::Image& image)
     logger(hyx::logger_literals::debug, "Converting to black and white\n");
 
     // magick in.png -auto-level -unsharp 0x2+1.5+0.05 -resize 200% -auto-threshold otsu out.pdf
+    // TODO: use -colorspace gray -auto-level -negate -lat 30x30+10% -negate
 
     image.autoLevel();
     constexpr auto unsharp_radius{0.0};
@@ -482,11 +501,11 @@ bool is_white(Magick::Image image)
     return false;
 }
 
-bool has_text(tesseract::TessBaseAPI* tess_api, PIX* pimage)
+bool has_text(PIX* pimage, tesseract::TessBaseAPI* tess_api)
 {
     tess_api->SetImage(pimage);
-    std::string image_text{tess_api->GetUTF8Text()};
-    return !image_text.empty();
+    std::unique_ptr<char> image_text{tess_api->GetUTF8Text()};
+    return !std::string_view(image_text.get()).empty();
 }
 
 PIX* magick2pix(Magick::Image& image)
@@ -578,8 +597,8 @@ int main(int argc, char** argv)
     try {
         logger("Initializing components\n");
 
-        SANE_Int sane_version{};
-        sane = &hyx::sane_init::get_instance(&sane_version);
+        sane = &hyx::sane_init::get_instance();
+        SANE_Int sane_version{sane->get_version()};
         if (sane_version) [[likely]] {
             logger(hyx::logger_literals::debug, "Initialized SANE {}.{}.{}\n", SANE_VERSION_MAJOR(sane_version), SANE_VERSION_MINOR(sane_version), SANE_VERSION_BUILD(sane_version));
         }
@@ -677,7 +696,7 @@ int main(int argc, char** argv)
                         logger("Keeping image\n");
 
                         if (is_bw(image)) {
-                            has_text(tess_api.get(), hyx::unique_pix(magick2pix(image)).get()) ? transform_with_text_to_bw(image) : transform_to_bw(image);
+                            has_text(hyx::unique_pix(magick2pix(image)).get(), tess_api.get()) ? transform_with_text_to_bw(image) : transform_to_bw(image);
                         }
                         else if (is_grayscale(image)) {
                             transform_to_grayscale(image);
