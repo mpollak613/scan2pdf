@@ -56,16 +56,13 @@
 #include "python.h"
 #include "sane.h"
 #include "units.h"
+#include "version.h"
 
 //! TODO: allow for other image formats if libtiff is not available
 #ifdef HAVE_LIBTIFF
 #include <tiffio.h>   // non-standard
 #include <tiffio.hxx> // non-standard
 #endif                // !HAVE_LIBTIFF
-
-namespace global {
-    constexpr std::string_view version{"2.4.2"};
-} // namespace global
 
 hyx::logger logger(std::clog, "[cl::utc;%FT%TZ][[[::lvl;^9]]]: [sl::file_name;]@[sl::line;]: ");
 
@@ -132,7 +129,7 @@ void print_help()
 
 void print_version()
 {
-    std::cout << "scan2pdf " << global::version << '\n';
+    std::cout << "scan2pdf " << get_scan2pdf_version() << '\n';
     std::cout << "Copyright (C) 2022-2024 Michael Pollak\n";
 }
 
