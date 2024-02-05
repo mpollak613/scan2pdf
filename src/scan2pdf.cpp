@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <format>
 #include <hyx/circular_buffer.h> // non-standard
 #include <hyx/filesystem.h>      // non-standard
 #include <hyx/logger.h>          // non-standard
@@ -123,8 +124,8 @@ void print_help()
 {
     std::cout << "Usage: scan2pdf [options...] file\n";
     std::cout << '\n';
-    std::cout << "-r, --resolution     sets the resolution of the scanned image [50...600]dpi\n";
-    std::cout << "-o, --output-path    save the file to a given directory\n";
+    std::cout << "-r, --resolution    sets the resolution of the scanned image [50...600]dpi\n";
+    std::cout << "-o, --outfile       save the file to a given directory\n";
 }
 
 void print_version()
@@ -181,20 +182,25 @@ void proccess(Magick::Image& image)
 
 int main(int argc, char** argv)
 {
-    std::string filename;
-    std::filesystem::path outpath{"./"};
-    const hyx::temporary_path tmppath{std::filesystem::temp_directory_path() / "scan2pdf"};
-    std::filesystem::path logpath{hyx::log_path() / "scan2pdf"};
+    std::ios_base::sync_with_stdio(false);
 
+    // NOTE: args will never be empty since argv[0] is the program name
+    const std::span<char*> args(argv, static_cast<std::size_t>(argc));
+
+    auto outfile{std::filesystem::absolute(std::format("{:%F-%H-%M-%S}", std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now())))};
+    const hyx::temporary_path tmppath{std::filesystem::temp_directory_path() / "scan2pdf"};
+    auto logpath{hyx::log_path() / "scan2pdf"};
     auto auto_mode{false};
 
-    // empty
-    if (argc == 1) {
-        print_help();
-        return 0;
-    }
-    for (auto idx{1}; idx < argc; ++idx) {
-        auto arg{std::string_view(argv[idx])};
+    for (auto it{std::ranges::next(args.begin())}, it_end{args.end()}; it != it_end; ++it) {
+        std::string_view arg{*it};
+
+        const auto assert_next_arg{[&it, &it_end, &arg]() {
+            if ((it + 1) == it_end) {
+                std::cerr << "ERROR: Missing argument for \'" << arg << "\'!\n";
+                std::exit(1);
+            }
+        }};
 
         if ((arg == "-h") || (arg == "--help")) {
             print_help();
@@ -204,39 +210,41 @@ int main(int argc, char** argv)
             print_version();
             return 0;
         }
-        else if (((arg == "-r") || (arg == "--resolution")) && ((idx + 1) < argc)) {
-            sane_options.at(SANE_NAME_SCAN_RESOLUTION) = std::stoi(argv[++idx]);
+        else if ((arg == "-r") || (arg == "--resolution")) {
+            assert_next_arg();
+            ++it;
+            sane_options.at(SANE_NAME_SCAN_RESOLUTION) = std::stoi(*it);
         }
-        else if (((arg == "-o") || (arg == "--outpath")) && ((idx + 1) < argc)) {
-            arg = std::string_view(argv[++idx]);
-            if (std::filesystem::exists(arg)) {
-                outpath = std::filesystem::absolute(arg);
-            }
-            else {
-                std::cout << "Path " << arg << " does not exist!\n";
+        else if ((arg == "-o") || (arg == "--outfile")) {
+            assert_next_arg();
+            ++it;
+            if (outfile = std::filesystem::absolute(*it); !(outfile.has_filename() && std::filesystem::exists(outfile.parent_path()))) {
+                std::cerr << "ERROR: Invalid output file " << outfile << "!\n";
                 return 1;
             }
+            // else, we are ok
         }
         else if (arg.starts_with("--auto=")) {
+            const auto autofile{arg.substr(arg.find('=') + 1)};
+            if (autofile.empty()) {
+                std::cerr << "ERROR: Missing auto format\n";
+                return 1;
+            }
+
+            outfile = std::filesystem::absolute(autofile);
+            if (!(outfile.has_filename() && std::filesystem::exists(outfile.parent_path()))) {
+                std::cerr << "ERROR: Invalid output file " << outfile << "!\n";
+                return 1;
+            }
+
             auto_mode = true;
-            filename = arg.substr(arg.find('=') + 1);
         }
-        // bad option
-        else if (arg.starts_with('-')) {
-            std::cout << "Unkown option \'" << arg << "\'!\n";
+        else {
+            std::cerr << "ERROR: Unkown option \'" << arg << "\'!\n";
             return 1;
         }
-        // stop at filename
-        else {
-            filename = arg;
-            break;
-        }
     }
-
-    if (filename.empty()) {
-        std::cout << "No filename detected!\n";
-        return 1;
-    }
+    outfile.replace_extension(".pdf");
 
     const auto prog_start{std::chrono::high_resolution_clock::now()};
     try {
@@ -283,7 +291,7 @@ int main(int argc, char** argv)
         catch (const std::exception& py_e) {
             // don't fail without python init; just continue without things that depend on it
             logger(hyx::logger_literals::warning, "Failed to initialize Python components: {}\n", py_e.what());
-            filename = std::regex_replace(filename, std::regex("%o"), "[org]");
+            outfile.replace_filename(std::regex_replace(outfile.filename().c_str(), std::regex("%o"), "[org]"));
         }
 
         logger("All components initialized\n");
@@ -393,12 +401,12 @@ int main(int argc, char** argv)
         Magick::writeImages(images.begin(), images.end(), combined_pages_filepath + ".tiff");
 
         if (auto_mode && !document_text.empty()) {
-            filename = std::regex_replace(filename, std::regex("%o"), parse_organization(document_text, "<org>"));
-            filename = std::regex_replace(filename, std::regex("%d"), hyx::parser::parse_date(document_text, get_current_date()));
-            filename = std::regex_replace(filename, std::regex("%s"), hyx::parser::parse_store(document_text, "<store>"));
-            filename = std::regex_replace(filename, std::regex("%t"), hyx::parser::parse_transaction(document_text, "<transaction>"));
+            outfile.replace_filename(std::regex_replace(outfile.filename().c_str(), std::regex("%o"), parse_organization(document_text, "<org>")));
+            outfile.replace_filename(std::regex_replace(outfile.filename().c_str(), std::regex("%d"), hyx::parser::parse_date(document_text, get_current_date())));
+            outfile.replace_filename(std::regex_replace(outfile.filename().c_str(), std::regex("%s"), hyx::parser::parse_store(document_text, "<store>")));
+            outfile.replace_filename(std::regex_replace(outfile.filename().c_str(), std::regex("%t"), hyx::parser::parse_transaction(document_text, "<transaction>")));
         }
-        logger(hyx::logger_literals::debug, "File name is \'{}\'\n", filename);
+        logger(hyx::logger_literals::debug, "File name is \'{}\'\n", outfile.filename().string());
 
         if (!tess_api->ProcessPages((combined_pages_filepath + ".tiff").c_str(), nullptr, static_cast<int>(10'000 * images_buffer.size()), std::make_unique<tesseract::TessPDFRenderer>(combined_pages_filepath.c_str(), tess_api->GetDatapath(), false).get())) {
             logger(hyx::logger_literals::warning, "OCR taking too long: skipping\n");
@@ -406,7 +414,7 @@ int main(int argc, char** argv)
         }
 
         std::error_code ecode;
-        if (!std::filesystem::copy_file(combined_pages_filepath + ".pdf", outpath / (filename + ".pdf"), std::filesystem::copy_options::update_existing, ecode)) {
+        if (!std::filesystem::copy_file(combined_pages_filepath + ".pdf", outfile, std::filesystem::copy_options::update_existing, ecode)) {
             throw std::runtime_error("Failed to move output file: \'" + ecode.message() + "\'");
         }
         logger(hyx::logger_literals::debug, "Moved file successfully\n");
