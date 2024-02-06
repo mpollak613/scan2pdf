@@ -36,6 +36,7 @@
 #include <limits>
 #include <memory>
 #include <numbers>
+#include <ostream>
 #include <ranges>
 #include <regex>
 #include <sane/sane.h>     // non-standard
@@ -65,21 +66,9 @@
 #include <tiffio.hxx> // non-standard
 #endif                // !HAVE_LIBTIFF
 
-hyx::logger logger(std::clog, "[cl::utc;%FT%TZ][[[::lvl;^9]]]: [sl::file_name;]@[sl::line;]: ");
+using sane_default_options_t = std::unordered_map<std::string_view, std::variant<SANE_Word, SANE_String_Const>>;
 
-/**
- * @brief Global options.
- */
-//! TODO: global options should get stored in a safer way
-static std::unordered_map<std::string, std::any> sane_options{
-    {SANE_NAME_SCAN_SOURCE, "ADF Duplex"},
-    {SANE_NAME_SCAN_MODE, SANE_VALUE_SCAN_MODE_COLOR},
-    {SANE_NAME_SCAN_RESOLUTION, 300},
-    {SANE_NAME_PAGE_HEIGHT, std::numeric_limits<SANE_Word>::max()},
-    {SANE_NAME_PAGE_WIDTH, std::numeric_limits<SANE_Word>::max()},
-    {"ald", false}};
-
-Magick::Image get_next_image(hyx::sane_device* device)
+Magick::Image get_next_image(hyx::logger& logger, hyx::sane_device* device)
 {
     const auto sane_params{device->get_parameters()};
 
@@ -134,28 +123,48 @@ void print_version()
     std::cout << "Copyright (C) 2022-2024 Michael Pollak\n";
 }
 
-void set_device_options(hyx::sane_device* device)
+hyx::logger init_logger(const std::filesystem::path& logfile)
+{
+    constexpr auto log_pattern{"[cl::utc;%FT%TZ][[[::lvl;^9]]]: [sl::file_name;]@[sl::line;]: "};
+
+    try {
+        return hyx::logger(logfile, log_pattern);
+    }
+    catch (const std::exception& e) {
+        std::cout << "WARNING: Failed to open file for logging: " << logfile << '\n';
+        // ok, return logger which outputs to null so we can continue
+        try {
+            return hyx::logger(nullptr, log_pattern);
+        }
+        catch (const std::exception& e) {
+            std::cout << "ERROR: Failed to initialize logger, valid or not!\n";
+            std::exit(1);
+        }
+    }
+}
+
+void set_device_options(hyx::sane_device* device, const sane_default_options_t& sane_options)
 {
     for (const auto& opt : device->get_options()) {
         if (sane_options.contains(opt->name)) {
             if (const auto bop{dynamic_cast<hyx::sane_device::bool_option*>(opt)}) {
-                device->set_option(bop, static_cast<SANE_Bool>(std::any_cast<bool>(sane_options.at(opt->name))));
+                device->set_option(bop, std::get<SANE_Bool>(sane_options.at(opt->name)));
             }
             else if (const auto fop{dynamic_cast<hyx::sane_device::fixed_option*>(opt)}) {
-                device->set_option(fop, std::any_cast<SANE_Fixed>(sane_options.at(opt->name)));
+                device->set_option(fop, std::get<SANE_Fixed>(sane_options.at(opt->name)));
             }
             else if (const auto iop{dynamic_cast<hyx::sane_device::int_option*>(opt)}) {
-                device->set_option(iop, std::any_cast<SANE_Int>(sane_options.at(opt->name)));
+                device->set_option(iop, std::get<SANE_Int>(sane_options.at(opt->name)));
             }
             else if (const auto sop{dynamic_cast<hyx::sane_device::string_option*>(opt)}) {
                 //! FIXME: const_cast is a bad idea (but last resort for now).
-                device->set_option(sop, const_cast<SANE_String>(std::any_cast<SANE_String_Const>(sane_options.at(opt->name))));
+                device->set_option(sop, const_cast<SANE_String>(std::get<SANE_String_Const>(sane_options.at(opt->name))));
             }
         }
     }
 }
 
-void proccess(Magick::Image& image)
+void proccess(hyx::logger& logger, Magick::Image& image)
 {
     // we need to despeckle before any trims so small artifacts won't mess with them
     image.despeckle();
@@ -191,6 +200,14 @@ int main(int argc, char** argv)
     const hyx::temporary_path tmppath{std::filesystem::temp_directory_path() / "scan2pdf"};
     auto logpath{hyx::log_path() / "scan2pdf"};
     auto auto_mode{false};
+
+    static sane_default_options_t sane_options{
+        {SANE_NAME_SCAN_SOURCE, "ADF Duplex"},
+        {SANE_NAME_SCAN_MODE, SANE_VALUE_SCAN_MODE_COLOR},
+        {SANE_NAME_SCAN_RESOLUTION, 300},
+        {SANE_NAME_PAGE_HEIGHT, std::numeric_limits<SANE_Int>::max()},
+        {SANE_NAME_PAGE_WIDTH, std::numeric_limits<SANE_Int>::max()},
+        {"ald", false}};
 
     for (auto it{std::ranges::next(args.begin())}, it_end{args.end()}; it != it_end; ++it) {
         std::string_view arg{*it};
@@ -247,14 +264,9 @@ int main(int argc, char** argv)
     outfile.replace_extension(".pdf");
 
     const auto prog_start{std::chrono::high_resolution_clock::now()};
-    try {
-        logger.swap_to(logpath / "scan2pdf.log");
-        logger("======Starting Program======\n");
-    }
-    catch (const std::exception& e) {
-        std::cout << "WARNING: Failed to open file for logging: " << logpath / "scan2pdf.log" << '\n';
-        // it is ok to continue without logging opened.
-    }
+
+    auto logger{init_logger(logpath / "scan2pdf.log")};
+    logger("======Starting Program======\n");
 
     hyx::sane_init* sane{};
     std::unique_ptr<tesseract::TessBaseAPI> tess_api;
@@ -304,8 +316,9 @@ int main(int argc, char** argv)
 
     try {
         hyx::sane_device* device{sane->open_device()};
+        logger("Opened device with name: {}", device->name);
 
-        set_device_options(device);
+        set_device_options(device, sane_options);
 
         if (!std::filesystem::exists(tmppath)) {
             std::filesystem::create_directory(tmppath);
@@ -320,10 +333,10 @@ int main(int argc, char** argv)
 
         { // jthread start
             // we only share the images container and atomic boolean—which gets set as the last thing the thread does—so it should be thread safe
-            std::jthread t1([&images_buffer, &device, &done_scanning]() {
+            std::jthread t1([&logger, &images_buffer, &device, &done_scanning]() {
                 for (auto i{0}; device->start(); ++i) {
                     logger("Obtaining image {}\n", i);
-                    images_buffer.emplace(get_next_image(device));
+                    images_buffer.emplace(get_next_image(logger, device));
                 }
 
                 // ok, we are done and images is not empty (unless nothing was scanned)
@@ -348,9 +361,9 @@ int main(int argc, char** argv)
 
                     // set image settings
                     image.compressType(Magick::LZWCompression);
-                    image.density(std::any_cast<SANE_Word>(sane_options.at(SANE_NAME_SCAN_RESOLUTION)));
+                    image.density(std::get<SANE_Int>(sane_options.at(SANE_NAME_SCAN_RESOLUTION)));
 
-                    proccess(image);
+                    proccess(logger, image);
 
                     dump_image(image, "proccessed");
 
