@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include <algorithm>
+#include <format>
 #include <memory>
 #include <ranges>
 #include <sane/sane.h>
@@ -36,7 +37,7 @@ std::span<const SANE_Device*> hyx::sane_init::get_devices(SANE_Bool is_local_onl
 
     std::size_t ndevices = std::distance(devices, std::ranges::find(devices, devices + INTMAX_MAX, nullptr));
 
-    return std::span<const SANE_Device*>(devices, ndevices);
+    return {devices, ndevices};
 }
 
 hyx::sane_init::sane_init(SANE_Int* version_code, SANE_Auth_Callback authorize)
@@ -102,6 +103,10 @@ SANE_Int hyx::sane_init::get_version() noexcept
     return this->version;
 }
 
+std::string hyx::sane_init::get_version_str() noexcept
+{
+    return std::format("{}.{}.{}", SANE_VERSION_MAJOR(this->version), SANE_VERSION_MINOR(this->version), SANE_VERSION_BUILD(this->version));
+}
 
 hyx::sane_device::sane_device(SANE_String_Const device_name)
     : name(device_name)

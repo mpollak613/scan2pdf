@@ -46,6 +46,7 @@
 #include <tesseract/baseapi.h>  // non-standard
 #include <tesseract/renderer.h> // non-standard
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -123,7 +124,7 @@ void print_version()
     std::cout << "Copyright (C) 2022-2024 Michael Pollak\n";
 }
 
-hyx::logger init_logger(const std::filesystem::path& logfile)
+auto init_logger(const std::filesystem::path& logfile)
 {
     constexpr auto log_pattern{"[cl::utc;%FT%TZ][[[::lvl;^9]]]: [sl::file_name;]@[sl::line;]: "};
 
@@ -140,6 +141,47 @@ hyx::logger init_logger(const std::filesystem::path& logfile)
             std::cout << "ERROR: Failed to initialize logger, valid or not!\n";
             std::exit(1);
         }
+    }
+}
+
+auto init(hyx::logger& logger, std::filesystem::path outfile, char** argv)
+{
+    try {
+        logger(hyx::logger_literals::debug, "Initializing components\n");
+
+        auto sane = &hyx::sane_init::get_instance();
+        logger(hyx::logger_literals::debug, "Initialized SANE {}\n", sane->get_version_str());
+
+        auto tess_api = std::make_unique<tesseract::TessBaseAPI>();
+        if (tess_api->Init(nullptr, "eng")) {
+            throw std::runtime_error("Could not initialize tesseract");
+        }
+        logger(hyx::logger_literals::debug, "Initialized Tesseract {}\n", tess_api->Version());
+
+        Magick::InitializeMagick(*argv);
+        if (!Magick::EnableOpenCL()) {
+            logger(hyx::logger_literals::warning, "GPU acceleration failed to initialize -> falling back to CPU only\n");
+        }
+        logger(hyx::logger_literals::debug, "Initialized {}\n", MagickCore::GetMagickVersion(nullptr));
+
+        try {
+            // we are just initializing python early so if it fails we know before starting the scan
+            std::ignore = hyx::py_init::get_instance().import("guess_organization");
+        }
+        catch (const std::exception& py_e) {
+            // don't fail without python init; just continue without things that depend on it
+            logger(hyx::logger_literals::warning, "Failed to initialize Python components: {}\n", py_e.what());
+            outfile.replace_filename(std::regex_replace(outfile.filename().c_str(), std::regex("%o"), "[org]"));
+        }
+
+        logger("Initialized Scan2pdf {}\n", get_scan2pdf_version());
+
+        return std::make_tuple(sane, std::unique_ptr<tesseract::TessBaseAPI>(tess_api.release()));
+    }
+    catch (const std::exception& e) {
+        std::cout << "Failed to Initialize: " << e.what() << '\n';
+        logger(hyx::logger_literals::fatal, "Failed to Initialize: {}", e.what());
+        std::exit(1);
     }
 }
 
@@ -268,53 +310,9 @@ int main(int argc, char** argv)
     auto logger{init_logger(logpath / "scan2pdf.log")};
     logger("======Starting Program======\n");
 
-    hyx::sane_init* sane{};
-    std::unique_ptr<tesseract::TessBaseAPI> tess_api;
-
     try {
-        logger("Initializing components\n");
+        auto [sane, tess_api] = init(logger, outfile, argv);
 
-        sane = &hyx::sane_init::get_instance();
-        SANE_Int sane_version{sane->get_version()};
-        if (sane_version) [[likely]] {
-            logger(hyx::logger_literals::debug, "Initialized SANE {}.{}.{}\n", SANE_VERSION_MAJOR(sane_version), SANE_VERSION_MINOR(sane_version), SANE_VERSION_BUILD(sane_version));
-        }
-        else [[unlikely]] {
-            logger(hyx::logger_literals::debug, "WARNING: unable to get SANE version\n");
-        }
-
-        tess_api = std::make_unique<tesseract::TessBaseAPI>();
-        if (tess_api->Init(nullptr, "eng")) {
-            throw std::runtime_error("Could not initialize tesseract");
-        }
-        tess_api->SetVariable("debug_file", (logpath / "tess.log").c_str());
-        logger(hyx::logger_literals::debug, "Initialized Tesseract {}\n", tess_api->Version());
-
-        Magick::InitializeMagick(*argv);
-        if (!Magick::EnableOpenCL()) {
-            logger(hyx::logger_literals::warning, "GPU acceleration failed to initialize -> falling back to CPU only\n");
-        }
-        logger(hyx::logger_literals::debug, "Initialized {}\n", MagickCore::GetMagickVersion(nullptr));
-
-        try {
-            // we are just initializing python early so if it fails we know before starting the scan
-            std::ignore = hyx::py_init::get_instance().import("guess_organization");
-        }
-        catch (const std::exception& py_e) {
-            // don't fail without python init; just continue without things that depend on it
-            logger(hyx::logger_literals::warning, "Failed to initialize Python components: {}\n", py_e.what());
-            outfile.replace_filename(std::regex_replace(outfile.filename().c_str(), std::regex("%o"), "[org]"));
-        }
-
-        logger("All components initialized\n");
-    }
-    catch (const std::exception& e) {
-        std::cout << "Failed to Initialize: " << e.what() << '\n';
-        logger(hyx::logger_literals::fatal, "Failed to Initialize: {}", e.what());
-        return 1;
-    }
-
-    try {
         hyx::sane_device* device{sane->open_device()};
         logger("Opened device with name: {}", device->name);
 

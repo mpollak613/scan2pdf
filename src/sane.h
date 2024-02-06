@@ -53,9 +53,9 @@ namespace hyx {
          */
         ~sane_init() noexcept;
 
-        // singletons should not copy
-        sane_init(const sane_init& si) = delete;
+        // singletons should not copy or move
         sane_init(sane_init& si) = delete;
+        sane_init(sane_init&&) = delete;
         sane_init& operator=(const sane_init& si) = delete;
         sane_init& operator=(sane_init&& si) = delete;
 
@@ -88,9 +88,15 @@ namespace hyx {
 
         /**
          * @brief Returns the version of the sane backend.
-         * @return The sane backend version as a string.
+         * @return The sane backend version.
          */
          [[nodiscard]] SANE_Int get_version() noexcept;
+
+         /**
+         * @brief Returns the version of the sane backend.
+         * @return The sane backend version as a string.
+         */
+         [[nodiscard]] std::string get_version_str() noexcept;
 
     private:
         /**
@@ -189,7 +195,12 @@ namespace hyx {
         SANE_String_Const title;
         SANE_String_Const desc;
 
-        virtual ~option() {}
+        option(const option&) = default;
+        option(option&&) = delete;
+        option& operator=(const option&) = default;
+        option& operator=(option&&) = delete;
+
+        virtual ~option() = default;
 
         constexpr SANE_Bool is_soft_selectable()
         {
